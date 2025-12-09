@@ -14,6 +14,7 @@ use std::{
     fmt::{self, Debug},
     future::Future,
     sync::Arc,
+    time::Duration,
 };
 use tokio_stream::Stream;
 use tower::util::ServiceFn;
@@ -39,6 +40,8 @@ pub use lambda_runtime_api_client::tracing;
 /// Types available to a Lambda function.
 mod types;
 
+#[cfg(all(unix, feature = "graceful-shutdown"))]
+use crate::runtime::SHUTDOWN_NOTIFY;
 use requests::EventErrorRequest;
 pub use runtime::{LambdaInvocation, Runtime};
 pub use types::{Context, FunctionResponse, IntoFunctionResponse, LambdaEvent, MetadataPrelude, StreamResponse};
@@ -59,6 +62,9 @@ pub struct Config {
     pub log_stream: String,
     /// The name of the Amazon CloudWatch Logs group for the function.
     pub log_group: String,
+    /// Maximum concurrent invocations for Lambda managed-concurrency environments.
+    /// Populated from `AWS_LAMBDA_MAX_CONCURRENCY` when present.
+    pub max_concurrency: Option<u32>,
 }
 
 type RefConfig = Arc<Config>;
@@ -75,7 +81,16 @@ impl Config {
             version: env::var("AWS_LAMBDA_FUNCTION_VERSION").expect("Missing AWS_LAMBDA_FUNCTION_VERSION env var"),
             log_stream: env::var("AWS_LAMBDA_LOG_STREAM_NAME").unwrap_or_default(),
             log_group: env::var("AWS_LAMBDA_LOG_GROUP_NAME").unwrap_or_default(),
+            max_concurrency: env::var("AWS_LAMBDA_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&c| c > 0),
         }
+    }
+
+    /// Returns true if concurrent runtime mode should be enabled.
+    pub fn is_concurrent(&self) -> bool {
+        self.max_concurrency.map(|c| c > 1).unwrap_or(false)
     }
 }
 
@@ -112,15 +127,15 @@ where
 /// ```
 pub async fn run<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
 where
-    F: Service<LambdaEvent<A>, Response = R>,
-    F::Future: Future<Output = Result<R, F::Error>>,
+    F: Service<LambdaEvent<A>, Response = R> + Clone + Send + 'static,
+    F::Future: Future<Output = Result<R, F::Error>> + Send + 'static,
     F::Error: Into<Diagnostic> + fmt::Debug,
-    A: for<'de> Deserialize<'de>,
-    R: IntoFunctionResponse<B, S>,
-    B: Serialize,
+    A: for<'de> Deserialize<'de> + Send + 'static,
+    R: IntoFunctionResponse<B, S> + Send + 'static,
+    B: Serialize + Send + 'static,
     S: Stream<Item = Result<D, E>> + Unpin + Send + 'static,
-    D: Into<bytes::Bytes> + Send,
-    E: Into<Error> + Send + Debug,
+    D: Into<bytes::Bytes> + Send + 'static,
+    E: Into<Error> + Send + Debug + 'static,
 {
     let runtime = Runtime::new(handler).layer(layers::TracingLayer::new());
     runtime.run().await
@@ -211,14 +226,26 @@ where
                     eprintln!("[runtime] Graceful shutdown in progress ...");
                     shutdown_hook().await;
                     eprintln!("[runtime] Graceful shutdown completed");
-                    std::process::exit(0);
+                    if let Some(tx) = SHUTDOWN_NOTIFY.get() {
+                        let _ = tx.send(true);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        std::process::exit(0);
+                    } else {
+                        std::process::exit(0);
+                    }
                 },
                 _sigterm = sigterm.recv()=> {
                     eprintln!("[runtime] SIGTERM received");
                     eprintln!("[runtime] Graceful shutdown in progress ...");
                     shutdown_hook().await;
                     eprintln!("[runtime] Graceful shutdown completed");
-                    std::process::exit(0);
+                    if let Some(tx) = SHUTDOWN_NOTIFY.get() {
+                        let _ = tx.send(true);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        std::process::exit(0);
+                    } else {
+                        std::process::exit(0);
+                    }
                 },
             }
         };

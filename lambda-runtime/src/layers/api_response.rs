@@ -51,6 +51,27 @@ impl<S, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem,
     }
 }
 
+impl<S, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem, StreamError> Clone
+    for RuntimeApiResponseService<
+        S,
+        EventPayload,
+        Response,
+        BufferedResponse,
+        StreamingResponse,
+        StreamItem,
+        StreamError,
+    >
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<S, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem, StreamError> Service<LambdaInvocation>
     for RuntimeApiResponseService<
         S,

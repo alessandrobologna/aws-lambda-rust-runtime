@@ -44,6 +44,18 @@ where
     }
 }
 
+impl<S> Clone for RuntimeApiClientService<S>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            client: self.client.clone(),
+        }
+    }
+}
+
 #[pin_project(project = RuntimeApiClientFutureProj)]
 pub enum RuntimeApiClientFuture<F> {
     First(#[pin] F, Arc<Client>),
