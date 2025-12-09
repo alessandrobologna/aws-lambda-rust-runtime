@@ -151,11 +151,23 @@ pub struct Adapter<'a, R, S> {
     _phantom_data: PhantomData<&'a R>,
 }
 
+impl<'a, R, S> Clone for Adapter<'a, R, S>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            _phantom_data: PhantomData,
+        }
+    }
+}
+
 impl<'a, R, S, E> From<S> for Adapter<'a, R, S>
 where
-    S: Service<Request, Response = R, Error = E>,
-    S::Future: Send + 'a,
-    R: IntoResponse,
+    S: Service<Request, Response = R, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    R: IntoResponse + Send + Sync + 'static,
 {
     fn from(service: S) -> Self {
         Adapter {
@@ -193,12 +205,12 @@ where
 ///
 /// This takes care of transforming the LambdaEvent into a [`Request`] and then
 /// converting the result into a `LambdaResponse`.
-pub async fn run<'a, R, S, E>(handler: S) -> Result<(), Error>
+pub async fn run<R, S, E>(handler: S) -> Result<(), Error>
 where
-    S: Service<Request, Response = R, Error = E>,
-    S::Future: Send + 'a,
-    R: IntoResponse,
-    E: std::fmt::Debug + Into<Diagnostic>,
+    S: Service<Request, Response = R, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    R: IntoResponse + Send + Sync + 'static,
+    E: std::fmt::Debug + Into<Diagnostic> + Send + 'static,
 {
     lambda_runtime::run(Adapter::from(handler)).await
 }

@@ -28,7 +28,10 @@ async fn main() -> Result<(), Error> {
     tracing::init_default_subscriber();
 
     let func = service_fn(my_handler);
-    lambda_runtime::run(func).await?;
+    if let Err(err) = lambda_runtime::run(func).await {
+        eprintln!("run error: {:?}", err);
+        return Err(err);
+    }
     Ok(())
 }
 

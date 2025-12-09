@@ -25,6 +25,7 @@ impl<S> Layer<S> for TracingLayer {
 }
 
 /// Tower service returned by [TracingLayer].
+#[derive(Clone)]
 pub struct TracingService<S> {
     inner: S,
 }

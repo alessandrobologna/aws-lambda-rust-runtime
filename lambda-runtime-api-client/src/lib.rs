@@ -41,6 +41,7 @@ impl Client {
         ClientBuilder {
             connector: HttpConnector::new(),
             uri: None,
+            pool_size: None,
         }
     }
 }
@@ -59,11 +60,16 @@ impl Client {
         self.client.request(req).map_err(Into::into).boxed()
     }
 
-    /// Create a new client with a given base URI and HTTP connector.
-    fn with(base: Uri, connector: HttpConnector) -> Self {
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .http1_max_buf_size(1024 * 1024)
-            .build(connector);
+    /// Create a new client with a given base URI, HTTP connector, and optional pool size hint.
+    fn with(base: Uri, connector: HttpConnector, pool_size: Option<usize>) -> Self {
+        let mut builder = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+        builder.http1_max_buf_size(1024 * 1024);
+
+        if let Some(size) = pool_size {
+            builder.pool_max_idle_per_host(size);
+        }
+
+        let client = builder.build(connector);
         Self { base, client }
     }
 
@@ -94,6 +100,7 @@ impl Client {
 pub struct ClientBuilder {
     connector: HttpConnector,
     uri: Option<http::Uri>,
+    pool_size: Option<usize>,
 }
 
 impl ClientBuilder {
@@ -102,13 +109,26 @@ impl ClientBuilder {
         ClientBuilder {
             connector,
             uri: self.uri,
+            pool_size: self.pool_size,
         }
     }
 
     /// Create a new builder with a given base URI.
     /// Inherits all other attributes from the existent builder.
     pub fn with_endpoint(self, uri: http::Uri) -> Self {
-        Self { uri: Some(uri), ..self }
+        Self {
+            uri: Some(uri),
+            pool_size: self.pool_size,
+            connector: self.connector,
+        }
+    }
+
+    /// Provide a pool size hint for the underlying Hyper client.
+    pub fn with_pool_size(self, pool_size: usize) -> Self {
+        Self {
+            pool_size: Some(pool_size),
+            ..self
+        }
     }
 
     /// Create the new client to interact with the Runtime API.
@@ -120,7 +140,7 @@ impl ClientBuilder {
                 uri.try_into().expect("Unable to convert to URL")
             }
         };
-        Ok(Client::with(uri, self.connector))
+        Ok(Client::with(uri, self.connector, self.pool_size))
     }
 }
 
@@ -181,5 +201,18 @@ mod tests {
             "http://localhost:9001/foo/2018-06-01/runtime/invocation/next",
             &req.uri().to_string()
         );
+    }
+
+    #[test]
+    fn builder_accepts_pool_size() {
+        let base = "http://localhost:9001";
+        let expected: Uri = base.parse().unwrap();
+        let client = Client::builder()
+            .with_pool_size(4)
+            .with_endpoint(base.parse().unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(client.base, expected);
     }
 }

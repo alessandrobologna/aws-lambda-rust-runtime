@@ -9,10 +9,7 @@ use futures_util::{Stream, TryFutureExt};
 pub use http::{self, Response};
 use http_body::Body;
 use lambda_runtime::{
-    tower::{
-        util::{MapRequest, MapResponse},
-        ServiceBuilder, ServiceExt,
-    },
+    tower::{util::BoxCloneService, ServiceBuilder, ServiceExt},
     Diagnostic,
 };
 pub use lambda_runtime::{Error, LambdaEvent, MetadataPrelude, Service, StreamResponse};
@@ -27,10 +24,22 @@ pub struct StreamAdapter<'a, S, B> {
     _phantom_data: PhantomData<&'a B>,
 }
 
+impl<'a, S, B> Clone for StreamAdapter<'a, S, B>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            _phantom_data: PhantomData,
+        }
+    }
+}
+
 impl<'a, S, B, E> From<S> for StreamAdapter<'a, S, B>
 where
-    S: Service<Request, Response = Response<B>, Error = E>,
-    S::Future: Send + 'a,
+    S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
     B: Body + Unpin + Send + 'static,
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,
@@ -45,15 +54,15 @@ where
 
 impl<'a, S, B, E> Service<LambdaEvent<LambdaRequest>> for StreamAdapter<'a, S, B>
 where
-    S: Service<Request, Response = Response<B>, Error = E>,
-    S::Future: Send + 'a,
+    S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
     B: Body + Unpin + Send + 'static,
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,
 {
     type Response = StreamResponse<BodyStream<B>>;
     type Error = E;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
@@ -78,27 +87,23 @@ where
 /// Used internally by [`run_with_streaming_response`]; not part of the public
 /// API.
 #[allow(clippy::type_complexity)]
-fn into_stream_service<'a, S, B, E>(
+fn into_stream_service<S, B, E>(
     handler: S,
-) -> MapResponse<
-    MapRequest<S, impl FnMut(LambdaEvent<LambdaRequest>) -> Request>,
-    impl FnOnce(Response<B>) -> StreamResponse<BodyStream<B>> + Clone,
->
+) -> BoxCloneService<LambdaEvent<LambdaRequest>, StreamResponse<BodyStream<B>>, E>
 where
-    S: Service<Request, Response = Response<B>, Error = E>,
-    S::Future: Send + 'a,
-    E: Debug + Into<Diagnostic>,
+    S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    E: Debug + Into<Diagnostic> + Send + 'static,
     B: Body + Unpin + Send + 'static,
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,
 {
-    ServiceBuilder::new()
-        .map_request(|req: LambdaEvent<LambdaRequest>| {
-            let event: Request = req.payload.into();
-            event.with_lambda_context(req.context)
-        })
+    let svc = ServiceBuilder::new()
+        .map_request(event_to_request as fn(LambdaEvent<LambdaRequest>) -> Request)
         .service(handler)
-        .map_response(into_stream_response)
+        .map_response(into_stream_response);
+
+    BoxCloneService::new(svc)
 }
 
 /// Converts an `http::Response<B>` into a streaming Lambda response.
@@ -128,6 +133,11 @@ where
     }
 }
 
+fn event_to_request(req: LambdaEvent<LambdaRequest>) -> Request {
+    let event: Request = req.payload.into();
+    event.with_lambda_context(req.context)
+}
+
 /// Runs the Lambda runtime with a handler that returns **streaming** HTTP
 /// responses.
 ///
@@ -135,11 +145,11 @@ where
 ///
 /// [AWS docs for response streaming]:
 ///     https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html
-pub async fn run_with_streaming_response<'a, S, B, E>(handler: S) -> Result<(), Error>
+pub async fn run_with_streaming_response<S, B, E>(handler: S) -> Result<(), Error>
 where
-    S: Service<Request, Response = Response<B>, Error = E>,
-    S::Future: Send + 'a,
-    E: Debug + Into<Diagnostic>,
+    S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    E: Debug + Into<Diagnostic> + Send + 'static,
     B: Body + Unpin + Send + 'static,
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,

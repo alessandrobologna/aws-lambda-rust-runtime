@@ -5,6 +5,7 @@ INTEG_API_INVOKE := RestApiUrl HttpApiUrl
 INTEG_EXTENSIONS := extension-fn extension-trait logs-trait
 # Using musl to run extensions on both AL1 and AL2
 INTEG_ARCH := x86_64-unknown-linux-musl
+RIE_MAX_CONCURRENCY ?= 4
 
 define uppercase
 $(shell sed -r 's/(^|-)(\w)/\U\2/g' <<< $(1))
@@ -112,3 +113,7 @@ fmt:
 
 test-rie:
 	./scripts/test-rie.sh $(EXAMPLE)
+
+# Run RIE in Lambda Managed Instance (LMI) mode with concurrent polling.
+test-rie-lmi:
+	RIE_MAX_CONCURRENCY=$(RIE_MAX_CONCURRENCY) ./scripts/test-rie.sh $(EXAMPLE)
