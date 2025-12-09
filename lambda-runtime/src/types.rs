@@ -104,13 +104,23 @@ impl Context {
     /// and the incoming request data.
     pub fn new(request_id: &str, env_config: RefConfig, headers: &HeaderMap) -> Result<Self, Error> {
         let client_context: Option<ClientContext> = if let Some(value) = headers.get("lambda-runtime-client-context") {
-            serde_json::from_str(value.to_str()?)?
+            let raw = value.to_str()?;
+            if raw.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str(raw)?)
+            }
         } else {
             None
         };
 
         let identity: Option<CognitoIdentity> = if let Some(value) = headers.get("lambda-runtime-cognito-identity") {
-            serde_json::from_str(value.to_str()?)?
+            let raw = value.to_str()?;
+            if raw.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str(raw)?)
+            }
         } else {
             None
         };

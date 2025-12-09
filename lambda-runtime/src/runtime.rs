@@ -4,13 +4,20 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
+use futures::{stream::FuturesUnordered, StreamExt as FuturesStreamExt};
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
-use std::{env, fmt::Debug, future::Future, sync::Arc};
-use tokio_stream::{Stream, StreamExt};
+use std::{
+    env,
+    fmt::Debug,
+    future::Future,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::{watch, Semaphore};
+use tokio_stream::Stream;
 use tower::{Layer, Service, ServiceExt};
-use tracing::trace;
+use tracing::{error, trace, warn};
 
 /* ----------------------------------------- INVOCATION ---------------------------------------- */
 
@@ -55,6 +62,11 @@ pub struct Runtime<S> {
     client: Arc<ApiClient>,
 }
 
+/// Global shutdown notifier used by concurrent runtime to coordinate graceful termination.
+pub(crate) static SHUTDOWN_NOTIFY: OnceLock<watch::Sender<bool>> = OnceLock::new();
+/// One-time marker to log X-Ray behavior in concurrent mode.
+static XRAY_LOGGED: OnceLock<()> = OnceLock::new();
+
 impl<F, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem, StreamError>
     Runtime<
         RuntimeApiClientService<
@@ -70,12 +82,12 @@ impl<F, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem,
         >,
     >
 where
-    F: Service<LambdaEvent<EventPayload>, Response = Response>,
-    F::Future: Future<Output = Result<Response, F::Error>>,
+    F: Service<LambdaEvent<EventPayload>, Response = Response> + Send + Clone + 'static,
+    F::Future: Future<Output = Result<Response, F::Error>> + Send + 'static,
     F::Error: Into<Diagnostic> + Debug,
-    EventPayload: for<'de> Deserialize<'de>,
-    Response: IntoFunctionResponse<BufferedResponse, StreamingResponse>,
-    BufferedResponse: Serialize,
+    EventPayload: for<'de> Deserialize<'de> + Send + 'static,
+    Response: IntoFunctionResponse<BufferedResponse, StreamingResponse> + Send + 'static,
+    BufferedResponse: Serialize + Send + 'static,
     StreamingResponse: Stream<Item = Result<StreamItem, StreamError>> + Unpin + Send + 'static,
     StreamItem: Into<bytes::Bytes> + Send,
     StreamError: Into<BoxError> + Send + Debug,
@@ -92,7 +104,13 @@ where
     pub fn new(handler: F) -> Self {
         trace!("Loading config from env");
         let config = Arc::new(Config::from_env());
-        let client = Arc::new(ApiClient::builder().build().expect("Unable to create a runtime client"));
+        let pool_size = config.max_concurrency.unwrap_or(1).max(1) as usize;
+        let client = Arc::new(
+            ApiClient::builder()
+                .with_pool_size(pool_size)
+                .build()
+                .expect("Unable to create a runtime client"),
+        );
         Self {
             service: wrap_handler(handler, client.clone()),
             config,
@@ -139,37 +157,168 @@ impl<S> Runtime<S> {
 
 impl<S> Runtime<S>
 where
-    S: Service<LambdaInvocation, Response = (), Error = BoxError>,
+    S: Service<LambdaInvocation, Response = (), Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send,
 {
     /// Start the runtime and begin polling for events on the Lambda Runtime API.
     pub async fn run(self) -> Result<(), BoxError> {
-        let incoming = incoming(&self.client);
-        Self::run_with_incoming(self.service, self.config, incoming).await
+        if self.config.is_concurrent() {
+            let max_concurrency = self.config.max_concurrency.unwrap_or(1);
+            Self::run_concurrent(self.service, self.config, self.client, max_concurrency).await
+        } else {
+            let incoming = incoming(&self.client);
+            Self::run_with_incoming(self.service, self.config, incoming).await
+        }
     }
 
+    /// Concurrent processing using windowed long-polls (for Lambda managed-concurrency).
+    async fn run_concurrent(
+        service: S,
+        config: Arc<Config>,
+        client: Arc<ApiClient>,
+        max_concurrency: u32,
+    ) -> Result<(), BoxError> {
+        let limit = max_concurrency as usize;
+        let semaphore = Arc::new(Semaphore::new(limit));
+        let mut polls = FuturesUnordered::new();
+        let mut handlers = FuturesUnordered::new();
+        let mut paused_polls = 0usize;
+        // Bound total spawned tasks (running + waiting on permits)
+        let max_spawned_tasks = limit * 2;
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let _ = SHUTDOWN_NOTIFY.set(shutdown_tx);
+        let mut shutting_down = false;
+
+        for _ in 0..limit {
+            polls.push(next_event_future(client.clone()));
+        }
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed(), if !shutting_down => {
+                    if *shutdown_rx.borrow() {
+                        shutting_down = true;
+                        trace!("Shutdown requested; draining handlers and stopping new polls");
+                        polls.clear();
+                    }
+                }
+
+                Some(result) = FuturesStreamExt::next(&mut polls) => {
+                    let event = match result {
+                        Ok(event) => event,
+                        Err(e) => {
+                            warn!(error = %e, "Error polling /next, retrying");
+                            polls.push(next_event_future(client.clone()));
+                            continue;
+                        }
+                    };
+
+                    let (parts, incoming) = event.into_parts();
+
+                    #[cfg(debug_assertions)]
+                    if parts.status == http::StatusCode::NO_CONTENT {
+                        if paused_polls == 0 && !shutting_down {
+                            polls.push(next_event_future(client.clone()));
+                        } else {
+                            paused_polls = paused_polls.saturating_sub(1);
+                        }
+                        continue;
+                    }
+
+                    let at_cap = handlers.len() >= max_spawned_tasks;
+                    if !at_cap && !shutting_down {
+                        polls.push(next_event_future(client.clone()));
+                    } else {
+                        paused_polls += 1;
+                    }
+
+                    // Collect body before spawning to release the HTTP connection earlier.
+                    let request_id = invoke_request_id(&parts.headers)?.to_owned();
+                    let body = incoming.collect().await?.to_bytes();
+                    let mut svc = service.clone();
+                    let cfg = config.clone();
+                    let sem = semaphore.clone();
+
+                    handlers.push(tokio::spawn(async move {
+                        // Permit acquired inside task (keeps event loop non-blocking)
+                        let _permit = sem.acquire_owned().await?;
+
+                        let context = match Context::new(&request_id, cfg, &parts.headers) {
+                            Ok(ctx) => ctx,
+                            Err(err) => {
+                                error!(request_id = %request_id, error = %err, "Context::new failed");
+                                return Err(err);
+                            }
+                        };
+
+                        // Inform users that X-Ray is available via context, not env var, in concurrent mode.
+                        XRAY_LOGGED.get_or_init(|| {
+                            trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
+                        });
+
+                        let invocation = LambdaInvocation { parts, body, context };
+
+                        trace!(request_id = %request_id, "Processing invocation");
+                        let ready = match svc.ready().await {
+                            Ok(r) => r,
+                            Err(err) => {
+                                error!(request_id = %request_id, error = %err, "Service not ready");
+                                return Err(err);
+                            }
+                        };
+                        if let Err(err) = ready.call(invocation).await {
+                            error!(request_id = %request_id, error = %err, "Handler call failed");
+                            return Err(err);
+                        }
+                        trace!(request_id = %request_id, "Invocation completed");
+                        Ok::<(), BoxError>(())
+                    }));
+                }
+
+                Some(result) = FuturesStreamExt::next(&mut handlers) => {
+                    result??;
+
+                    if paused_polls > 0 && handlers.len() < max_spawned_tasks && !shutting_down {
+                        paused_polls -= 1;
+                        polls.push(next_event_future(client.clone()));
+                    }
+
+                    if shutting_down && handlers.is_empty() {
+                        trace!("All handlers drained after shutdown");
+                        break;
+                    }
+                }
+
+                else => break,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<S> Runtime<S>
+where
+    S: Service<LambdaInvocation, Response = (), Error = BoxError>,
+{
     /// Internal utility function to start the runtime with a customized incoming stream.
-    /// This implements the core of the [Runtime::run] method.
+    /// This implements the sequential mode of the runtime.
     pub(crate) async fn run_with_incoming(
         mut service: S,
         config: Arc<Config>,
         incoming: impl Stream<Item = Result<http::Response<hyper::body::Incoming>, BoxError>> + Send,
     ) -> Result<(), BoxError> {
         tokio::pin!(incoming);
-        while let Some(next_event_response) = incoming.next().await {
+        while let Some(next_event_response) = tokio_stream::StreamExt::next(&mut incoming).await {
             trace!("New event arrived (run loop)");
             let event = next_event_response?;
             let (parts, incoming) = event.into_parts();
 
             #[cfg(debug_assertions)]
             if parts.status == http::StatusCode::NO_CONTENT {
-                // Ignore the event if the status code is 204.
-                // This is a way to keep the runtime alive when
-                // there are no events pending to be processed.
                 continue;
             }
 
-            // Build the invocation such that it can be sent to the service right away
-            // when it is ready
             let body = incoming.collect().await?.to_bytes();
             let context = Context::new(invoke_request_id(&parts.headers)?, config.clone(), &parts.headers)?;
             let invocation = LambdaInvocation { parts, body, context };
@@ -177,10 +326,7 @@ where
             // Setup Amazon's default tracing data
             amzn_trace_env(&invocation.context);
 
-            // Wait for service to be ready
             let ready = service.ready().await?;
-
-            // Once ready, call the service which will respond to the Lambda runtime API
             ready.call(invocation).await?;
         }
         Ok(())
@@ -231,6 +377,12 @@ fn incoming(
             yield res;
         }
     }
+}
+
+/// Creates a future that polls the `/next` endpoint.
+async fn next_event_future(client: Arc<ApiClient>) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
+    let req = NextEventRequest.into_req()?;
+    client.call(req).await
 }
 
 fn amzn_trace_env(ctx: &Context) {
@@ -456,6 +608,7 @@ mod endpoint_tests {
             version: "1".to_string(),
             log_stream: "test_stream".to_string(),
             log_group: "test_log".to_string(),
+            max_concurrency: None,
         });
 
         let client = Arc::new(client);
@@ -484,5 +637,59 @@ mod endpoint_tests {
             panic!("This is intentionally here");
         })
         .await
+    }
+
+    #[test]
+    fn config_parses_max_concurrency() {
+        // Preserve existing env values
+        let prev_fn = env::var("AWS_LAMBDA_FUNCTION_NAME").ok();
+        let prev_mem = env::var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE").ok();
+        let prev_ver = env::var("AWS_LAMBDA_FUNCTION_VERSION").ok();
+        let prev_log_stream = env::var("AWS_LAMBDA_LOG_STREAM_NAME").ok();
+        let prev_log_group = env::var("AWS_LAMBDA_LOG_GROUP_NAME").ok();
+        let prev_max = env::var("AWS_LAMBDA_MAX_CONCURRENCY").ok();
+
+        env::set_var("AWS_LAMBDA_FUNCTION_NAME", "test_fn");
+        env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128");
+        env::set_var("AWS_LAMBDA_FUNCTION_VERSION", "1");
+        env::set_var("AWS_LAMBDA_LOG_STREAM_NAME", "test_stream");
+        env::set_var("AWS_LAMBDA_LOG_GROUP_NAME", "test_log");
+        env::set_var("AWS_LAMBDA_MAX_CONCURRENCY", "4");
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.max_concurrency, Some(4));
+        assert!(cfg.is_concurrent());
+
+        // Restore env
+        if let Some(v) = prev_fn {
+            env::set_var("AWS_LAMBDA_FUNCTION_NAME", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_FUNCTION_NAME");
+        }
+        if let Some(v) = prev_mem {
+            env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
+        }
+        if let Some(v) = prev_ver {
+            env::set_var("AWS_LAMBDA_FUNCTION_VERSION", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_FUNCTION_VERSION");
+        }
+        if let Some(v) = prev_log_stream {
+            env::set_var("AWS_LAMBDA_LOG_STREAM_NAME", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_LOG_STREAM_NAME");
+        }
+        if let Some(v) = prev_log_group {
+            env::set_var("AWS_LAMBDA_LOG_GROUP_NAME", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_LOG_GROUP_NAME");
+        }
+        if let Some(v) = prev_max {
+            env::set_var("AWS_LAMBDA_MAX_CONCURRENCY", v);
+        } else {
+            env::remove_var("AWS_LAMBDA_MAX_CONCURRENCY");
+        }
     }
 }
