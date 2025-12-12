@@ -127,6 +127,30 @@ where
 /// ```
 pub async fn run<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
 where
+    F: Service<LambdaEvent<A>, Response = R>,
+    F::Future: Future<Output = Result<R, F::Error>>,
+    F::Error: Into<Diagnostic> + fmt::Debug,
+    A: for<'de> Deserialize<'de>,
+    R: IntoFunctionResponse<B, S>,
+    B: Serialize,
+    S: Stream<Item = Result<D, E>> + Unpin + Send + 'static,
+    D: Into<bytes::Bytes> + Send,
+    E: Into<Error> + Send + Debug,
+{
+    let runtime = Runtime::new(handler).layer(layers::TracingLayer::new());
+    runtime.run().await
+}
+
+/// Starts the Lambda Rust runtime in a mode that is compatible with
+/// Lambda Managed Instances (concurrent invocations).
+///
+/// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
+/// will use a concurrent `/next` polling loop with a bounded number of
+/// in-flight handler tasks. When the environment variable is unset or `<= 1`,
+/// it falls back to the same sequential behavior as [`run`], so the same
+/// handler can run on both classic Lambda and Lambda Managed Instances.
+pub async fn run_concurrent<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
+where
     F: Service<LambdaEvent<A>, Response = R> + Clone + Send + 'static,
     F::Future: Future<Output = Result<R, F::Error>> + Send + 'static,
     F::Error: Into<Diagnostic> + fmt::Debug,
@@ -138,7 +162,7 @@ where
     E: Into<Error> + Send + Debug + 'static,
 {
     let runtime = Runtime::new(handler).layer(layers::TracingLayer::new());
-    runtime.run().await
+    runtime.run_concurrent().await
 }
 
 /// Spawns a task that will be execute a provided async closure when the process
