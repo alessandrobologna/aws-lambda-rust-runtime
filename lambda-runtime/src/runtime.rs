@@ -82,12 +82,12 @@ impl<F, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem,
         >,
     >
 where
-    F: Service<LambdaEvent<EventPayload>, Response = Response> + Send + Clone + 'static,
-    F::Future: Future<Output = Result<Response, F::Error>> + Send + 'static,
+    F: Service<LambdaEvent<EventPayload>, Response = Response>,
+    F::Future: Future<Output = Result<Response, F::Error>>,
     F::Error: Into<Diagnostic> + Debug,
-    EventPayload: for<'de> Deserialize<'de> + Send + 'static,
-    Response: IntoFunctionResponse<BufferedResponse, StreamingResponse> + Send + 'static,
-    BufferedResponse: Serialize + Send + 'static,
+    EventPayload: for<'de> Deserialize<'de>,
+    Response: IntoFunctionResponse<BufferedResponse, StreamingResponse>,
+    BufferedResponse: Serialize,
     StreamingResponse: Stream<Item = Result<StreamItem, StreamError>> + Unpin + Send + 'static,
     StreamItem: Into<bytes::Bytes> + Send,
     StreamError: Into<BoxError> + Send + Debug,
@@ -160,11 +160,15 @@ where
     S: Service<LambdaInvocation, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send,
 {
-    /// Start the runtime and begin polling for events on the Lambda Runtime API.
-    pub async fn run(self) -> Result<(), BoxError> {
+    /// Start the runtime in concurrent mode when configured for Lambda managed-concurrency.
+    ///
+    /// If `AWS_LAMBDA_MAX_CONCURRENCY` is not set or is `<= 1`, this falls back to the
+    /// sequential `run_with_incoming` loop so that the same handler can run on both
+    /// classic Lambda and Lambda Managed Instances.
+    pub async fn run_concurrent(self) -> Result<(), BoxError> {
         if self.config.is_concurrent() {
             let max_concurrency = self.config.max_concurrency.unwrap_or(1);
-            Self::run_concurrent(self.service, self.config, self.client, max_concurrency).await
+            Self::run_concurrent_inner(self.service, self.config, self.client, max_concurrency).await
         } else {
             let incoming = incoming(&self.client);
             Self::run_with_incoming(self.service, self.config, incoming).await
@@ -172,7 +176,7 @@ where
     }
 
     /// Concurrent processing using windowed long-polls (for Lambda managed-concurrency).
-    async fn run_concurrent(
+    async fn run_concurrent_inner(
         service: S,
         config: Arc<Config>,
         client: Arc<ApiClient>,
@@ -301,24 +305,35 @@ impl<S> Runtime<S>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError>,
 {
+    /// Start the runtime and begin polling for events on the Lambda Runtime API.
+    pub async fn run(self) -> Result<(), BoxError> {
+        let incoming = incoming(&self.client);
+        Self::run_with_incoming(self.service, self.config, incoming).await
+    }
+
     /// Internal utility function to start the runtime with a customized incoming stream.
-    /// This implements the sequential mode of the runtime.
+    /// This implements the core of the [Runtime::run] method.
     pub(crate) async fn run_with_incoming(
         mut service: S,
         config: Arc<Config>,
         incoming: impl Stream<Item = Result<http::Response<hyper::body::Incoming>, BoxError>> + Send,
     ) -> Result<(), BoxError> {
         tokio::pin!(incoming);
-        while let Some(next_event_response) = tokio_stream::StreamExt::next(&mut incoming).await {
+        while let Some(next_event_response) = incoming.next().await {
             trace!("New event arrived (run loop)");
             let event = next_event_response?;
             let (parts, incoming) = event.into_parts();
 
             #[cfg(debug_assertions)]
             if parts.status == http::StatusCode::NO_CONTENT {
+                // Ignore the event if the status code is 204.
+                // This is a way to keep the runtime alive when
+                // there are no events pending to be processed.
                 continue;
             }
 
+            // Build the invocation such that it can be sent to the service right away
+            // when it is ready
             let body = incoming.collect().await?.to_bytes();
             let context = Context::new(invoke_request_id(&parts.headers)?, config.clone(), &parts.headers)?;
             let invocation = LambdaInvocation { parts, body, context };
@@ -326,7 +341,10 @@ where
             // Setup Amazon's default tracing data
             amzn_trace_env(&invocation.context);
 
+            // Wait for service to be ready
             let ready = service.ready().await?;
+
+            // Once ready, call the service which will respond to the Lambda runtime API
             ready.call(invocation).await?;
         }
         Ok(())
