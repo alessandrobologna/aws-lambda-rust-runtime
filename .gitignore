@@ -16,5 +16,3 @@ build
 
 node_modules
 cdk.out
-.docs/
-Dockerfile.rie-local
