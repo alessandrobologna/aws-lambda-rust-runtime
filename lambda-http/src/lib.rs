@@ -165,9 +165,9 @@ where
 
 impl<'a, R, S, E> From<S> for Adapter<'a, R, S>
 where
-    S: Service<Request, Response = R, Error = E> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    R: IntoResponse + Send + Sync + 'static,
+    S: Service<Request, Response = R, Error = E>,
+    S::Future: Send + 'a,
+    R: IntoResponse,
 {
     fn from(service: S) -> Self {
         Adapter {
@@ -205,14 +205,32 @@ where
 ///
 /// This takes care of transforming the LambdaEvent into a [`Request`] and then
 /// converting the result into a `LambdaResponse`.
-pub async fn run<R, S, E>(handler: S) -> Result<(), Error>
+pub async fn run<'a, R, S, E>(handler: S) -> Result<(), Error>
+where
+    S: Service<Request, Response = R, Error = E>,
+    S::Future: Send + 'a,
+    R: IntoResponse,
+    E: std::fmt::Debug + Into<Diagnostic>,
+{
+    lambda_runtime::run(Adapter::from(handler)).await
+}
+
+/// Starts the Lambda Rust runtime in a mode that is compatible with
+/// Lambda Managed Instances (concurrent invocations).
+///
+/// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
+/// will use a concurrent `/next` polling loop with a bounded number of
+/// in-flight handler tasks. When the environment variable is unset or `<= 1`,
+/// it falls back to the same sequential behavior as [`run`], so the same
+/// handler can run on both classic Lambda and Lambda Managed Instances.
+pub async fn run_concurrent<R, S, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = R, Error = E> + Clone + Send + 'static,
     S::Future: Send + 'static,
     R: IntoResponse + Send + Sync + 'static,
     E: std::fmt::Debug + Into<Diagnostic> + Send + 'static,
 {
-    lambda_runtime::run(Adapter::from(handler)).await
+    lambda_runtime::run_concurrent(Adapter::from(handler)).await
 }
 
 #[cfg(test)]
