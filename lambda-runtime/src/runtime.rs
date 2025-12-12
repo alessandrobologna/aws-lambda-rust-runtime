@@ -4,7 +4,7 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
-use futures::{stream::FuturesUnordered, StreamExt as FuturesStreamExt};
+use futures::stream::FuturesUnordered;
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tokio::sync::{watch, Semaphore};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
 use tracing::{error, trace, warn};
 
@@ -207,7 +207,7 @@ where
                     }
                 }
 
-                Some(result) = FuturesStreamExt::next(&mut polls) => {
+                Some(result) = futures::StreamExt::next(&mut polls) => {
                     let event = match result {
                         Ok(event) => event,
                         Err(e) => {
@@ -279,7 +279,7 @@ where
                     }));
                 }
 
-                Some(result) = FuturesStreamExt::next(&mut handlers) => {
+                Some(result) = futures::StreamExt::next(&mut handlers) => {
                     result??;
 
                     if paused_polls > 0 && handlers.len() < max_spawned_tasks && !shutting_down {

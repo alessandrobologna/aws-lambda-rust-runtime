@@ -116,11 +116,7 @@ impl ClientBuilder {
     /// Create a new builder with a given base URI.
     /// Inherits all other attributes from the existent builder.
     pub fn with_endpoint(self, uri: http::Uri) -> Self {
-        Self {
-            uri: Some(uri),
-            pool_size: self.pool_size,
-            connector: self.connector,
-        }
+        Self { uri: Some(uri), ..self }
     }
 
     /// Provide a pool size hint for the underlying Hyper client.
