@@ -102,7 +102,7 @@ use std::{
 };
 
 mod streaming;
-pub use streaming::{run_with_streaming_response, StreamAdapter};
+pub use streaming::{run_with_streaming_response, run_with_streaming_response_concurrent, StreamAdapter};
 
 /// Type alias for `http::Request`s with a fixed [`Body`](enum.Body.html) type
 pub type Request = http::Request<Body>;

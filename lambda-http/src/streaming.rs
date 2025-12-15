@@ -100,7 +100,6 @@ where
 
 /// Builds a streaming-aware Tower service from a `Service<Request>` that can be
 /// cloned and sent across tasks. This is used by the concurrent HTTP entrypoint.
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 fn into_stream_service_boxed<S, B, E>(
     handler: S,
@@ -178,7 +177,6 @@ where
 /// This uses a cloneable, boxed service internally so it can be driven by the
 /// concurrent runtime. When `AWS_LAMBDA_MAX_CONCURRENCY` is not set or `<= 1`,
 /// it falls back to the same sequential behavior as [`run_with_streaming_response`].
-#[allow(dead_code)]
 pub async fn run_with_streaming_response_concurrent<S, B, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
