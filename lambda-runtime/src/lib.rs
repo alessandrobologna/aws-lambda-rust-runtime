@@ -14,7 +14,6 @@ use std::{
     fmt::{self, Debug},
     future::Future,
     sync::Arc,
-    time::Duration,
 };
 use tokio_stream::Stream;
 use tower::util::ServiceFn;
@@ -44,6 +43,8 @@ mod types;
 use crate::runtime::SHUTDOWN_NOTIFY;
 use requests::EventErrorRequest;
 pub use runtime::{LambdaInvocation, Runtime};
+#[cfg(all(unix, feature = "graceful-shutdown"))]
+use std::time::Duration;
 pub use types::{Context, FunctionResponse, IntoFunctionResponse, LambdaEvent, MetadataPrelude, StreamResponse};
 
 /// Error type that lambdas may result in
