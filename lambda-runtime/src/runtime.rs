@@ -194,11 +194,16 @@ where
         }
         workers.push(tokio::spawn(concurrent_worker_loop(
             service,
-            config.clone(),
-            client.clone(),
-            shutdown_rx.clone(),
+            config,
+            client,
+            shutdown_rx,
         )));
 
+        // Track the first infrastructure error to return as the result.
+        // Note: Handler errors (Err returned from user code) do NOT trigger this;
+        // they are reported to Lambda via /invocation/{id}/error and the worker
+        // continues. This only captures unrecoverable runtime failures like
+        // network errors, API client failures, or worker panics.
         let mut first_error: Option<BoxError> = None;
         while let Some(result) = futures::StreamExt::next(&mut workers).await {
             match result {
@@ -253,7 +258,7 @@ where
         while let Some(next_event_response) = incoming.next().await {
             trace!("New event arrived (run loop)");
             let event = next_event_response?;
-            drive_event_loop_iteration(&mut service, &config, event, true).await?;
+            process_invocation(&mut service, &config, event, true).await?;
         }
         Ok(())
     }
@@ -346,7 +351,7 @@ where
                     }
                 };
 
-                drive_event_loop_iteration(&mut service, &config, event, false).await?;
+                process_invocation(&mut service, &config, event, false).await?;
             }
         }
     }
@@ -354,7 +359,7 @@ where
     Ok(())
 }
 
-async fn drive_event_loop_iteration<S>(
+async fn process_invocation<S>(
     service: &mut S,
     config: &Arc<Config>,
     event: http::Response<hyper::body::Incoming>,
