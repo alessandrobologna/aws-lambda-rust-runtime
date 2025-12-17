@@ -62,8 +62,6 @@ pub struct Runtime<S> {
     client: Arc<ApiClient>,
 }
 
-/// Global shutdown notifier used by concurrent runtime to coordinate graceful termination.
-pub(crate) static SHUTDOWN_NOTIFY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 /// One-time marker to log X-Ray behavior in concurrent mode.
 static XRAY_LOGGED: OnceLock<()> = OnceLock::new();
 
@@ -184,7 +182,6 @@ where
     ) -> Result<(), BoxError> {
         let limit = max_concurrency as usize;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let _ = SHUTDOWN_NOTIFY.set(shutdown_tx.clone());
 
         let mut workers = FuturesUnordered::new();
         for _ in 1..limit {
