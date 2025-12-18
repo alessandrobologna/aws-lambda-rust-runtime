@@ -14,7 +14,7 @@ use std::{
     future::Future,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::watch;
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
 use tracing::{error, trace, warn};
@@ -62,8 +62,6 @@ pub struct Runtime<S> {
     client: Arc<ApiClient>,
 }
 
-/// Global shutdown notifier used by concurrent runtime to coordinate graceful termination.
-pub(crate) static SHUTDOWN_NOTIFY: OnceLock<watch::Sender<bool>> = OnceLock::new();
 /// One-time marker to log X-Ray behavior in concurrent mode.
 static XRAY_LOGGED: OnceLock<()> = OnceLock::new();
 
@@ -175,7 +173,7 @@ where
         }
     }
 
-    /// Concurrent processing using windowed long-polls (for Lambda managed-concurrency).
+    /// Concurrent processing using N independent long-poll loops (for Lambda managed-concurrency).
     async fn run_concurrent_inner(
         service: S,
         config: Arc<Config>,
@@ -183,121 +181,59 @@ where
         max_concurrency: u32,
     ) -> Result<(), BoxError> {
         let limit = max_concurrency as usize;
-        let semaphore = Arc::new(Semaphore::new(limit));
-        let mut polls = FuturesUnordered::new();
-        let mut handlers = FuturesUnordered::new();
-        let mut paused_polls = 0usize;
-        // Bound total spawned tasks (running + waiting on permits)
-        let max_spawned_tasks = limit * 2;
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let _ = SHUTDOWN_NOTIFY.set(shutdown_tx);
-        let mut shutting_down = false;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        for _ in 0..limit {
-            polls.push(next_event_future(client.clone()));
+        let mut workers = FuturesUnordered::new();
+        for _ in 1..limit {
+            workers.push(tokio::spawn(concurrent_worker_loop(
+                service.clone(),
+                config.clone(),
+                client.clone(),
+                shutdown_rx.clone(),
+            )));
         }
+        workers.push(tokio::spawn(concurrent_worker_loop(
+            service,
+            config,
+            client,
+            shutdown_rx,
+        )));
 
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed(), if !shutting_down => {
-                    if *shutdown_rx.borrow() {
-                        shutting_down = true;
-                        trace!("Shutdown requested; draining handlers and stopping new polls");
-                        polls.clear();
-                    }
-                }
-
-                Some(result) = futures::StreamExt::next(&mut polls) => {
-                    let event = match result {
-                        Ok(event) => event,
-                        Err(e) => {
-                            warn!(error = %e, "Error polling /next, retrying");
-                            polls.push(next_event_future(client.clone()));
-                            continue;
-                        }
-                    };
-
-                    let (parts, incoming) = event.into_parts();
-
-                    #[cfg(debug_assertions)]
-                    if parts.status == http::StatusCode::NO_CONTENT {
-                        if paused_polls == 0 && !shutting_down {
-                            polls.push(next_event_future(client.clone()));
-                        } else {
-                            paused_polls = paused_polls.saturating_sub(1);
-                        }
-                        continue;
-                    }
-
-                    let at_cap = handlers.len() >= max_spawned_tasks;
-                    if !at_cap && !shutting_down {
-                        polls.push(next_event_future(client.clone()));
+        // Track the first infrastructure error to return as the result.
+        // Note: Handler errors (Err returned from user code) do NOT trigger this;
+        // they are reported to Lambda via /invocation/{id}/error and the worker
+        // continues. This only captures unrecoverable runtime failures like
+        // network errors, API client failures, or worker panics.
+        let mut first_error: Option<BoxError> = None;
+        while let Some(result) = futures::StreamExt::next(&mut workers).await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        error!(error = %err, "Concurrent worker exited with error; shutting down");
+                        let _ = shutdown_tx.send(true);
+                        first_error = Some(err);
                     } else {
-                        paused_polls += 1;
-                    }
-
-                    // Collect body before spawning to release the HTTP connection earlier.
-                    let request_id = invoke_request_id(&parts.headers)?.to_owned();
-                    let body = incoming.collect().await?.to_bytes();
-                    let mut svc = service.clone();
-                    let cfg = config.clone();
-                    let sem = semaphore.clone();
-
-                    handlers.push(tokio::spawn(async move {
-                        // Permit acquired inside task (keeps event loop non-blocking)
-                        let _permit = sem.acquire_owned().await?;
-
-                        let context = match Context::new(&request_id, cfg, &parts.headers) {
-                            Ok(ctx) => ctx,
-                            Err(err) => {
-                                error!(request_id = %request_id, error = %err, "Context::new failed");
-                                return Err(err);
-                            }
-                        };
-
-                        // Inform users that X-Ray is available via context, not env var, in concurrent mode.
-                        XRAY_LOGGED.get_or_init(|| {
-                            trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
-                        });
-
-                        let invocation = LambdaInvocation { parts, body, context };
-
-                        trace!(request_id = %request_id, "Processing invocation");
-                        let ready = match svc.ready().await {
-                            Ok(r) => r,
-                            Err(err) => {
-                                error!(request_id = %request_id, error = %err, "Service not ready");
-                                return Err(err);
-                            }
-                        };
-                        if let Err(err) = ready.call(invocation).await {
-                            error!(request_id = %request_id, error = %err, "Handler call failed");
-                            return Err(err);
-                        }
-                        trace!(request_id = %request_id, "Invocation completed");
-                        Ok::<(), BoxError>(())
-                    }));
-                }
-
-                Some(result) = futures::StreamExt::next(&mut handlers) => {
-                    result??;
-
-                    if paused_polls > 0 && handlers.len() < max_spawned_tasks && !shutting_down {
-                        paused_polls -= 1;
-                        polls.push(next_event_future(client.clone()));
-                    }
-
-                    if shutting_down && handlers.is_empty() {
-                        trace!("All handlers drained after shutdown");
-                        break;
+                        error!(error = %err, "Concurrent worker exited with error");
                     }
                 }
-
-                else => break,
+                Err(join_err) => {
+                    let err: BoxError = Box::new(join_err);
+                    if first_error.is_none() {
+                        error!(error = %err, "Concurrent worker panicked; shutting down");
+                        let _ = shutdown_tx.send(true);
+                        first_error = Some(err);
+                    } else {
+                        error!(error = %err, "Concurrent worker panicked");
+                    }
+                }
             }
         }
 
-        Ok(())
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
@@ -322,30 +258,7 @@ where
         while let Some(next_event_response) = incoming.next().await {
             trace!("New event arrived (run loop)");
             let event = next_event_response?;
-            let (parts, incoming) = event.into_parts();
-
-            #[cfg(debug_assertions)]
-            if parts.status == http::StatusCode::NO_CONTENT {
-                // Ignore the event if the status code is 204.
-                // This is a way to keep the runtime alive when
-                // there are no events pending to be processed.
-                continue;
-            }
-
-            // Build the invocation such that it can be sent to the service right away
-            // when it is ready
-            let body = incoming.collect().await?.to_bytes();
-            let context = Context::new(invoke_request_id(&parts.headers)?, config.clone(), &parts.headers)?;
-            let invocation = LambdaInvocation { parts, body, context };
-
-            // Setup Amazon's default tracing data
-            amzn_trace_env(&invocation.context);
-
-            // Wait for service to be ready
-            let ready = service.ready().await?;
-
-            // Once ready, call the service which will respond to the Lambda runtime API
-            ready.call(invocation).await?;
+            process_invocation(&mut service, &config, event, true).await?;
         }
         Ok(())
     }
@@ -401,6 +314,92 @@ fn incoming(
 async fn next_event_future(client: Arc<ApiClient>) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
     let req = NextEventRequest.into_req()?;
     client.call(req).await
+}
+
+async fn concurrent_worker_loop<S>(
+    mut service: S,
+    config: Arc<Config>,
+    client: Arc<ApiClient>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BoxError>
+where
+    S: Service<LambdaInvocation, Response = (), Error = BoxError>,
+    S::Future: Send,
+{
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            result = next_event_future(client.clone()) => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(e) => {
+                        warn!(error = %e, "Error polling /next, retrying");
+                        continue;
+                    }
+                };
+
+                process_invocation(&mut service, &config, event, false).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_invocation<S>(
+    service: &mut S,
+    config: &Arc<Config>,
+    event: http::Response<hyper::body::Incoming>,
+    set_amzn_trace_env: bool,
+) -> Result<(), BoxError>
+where
+    S: Service<LambdaInvocation, Response = (), Error = BoxError>,
+{
+    let (parts, incoming) = event.into_parts();
+
+    #[cfg(debug_assertions)]
+    if parts.status == http::StatusCode::NO_CONTENT {
+        // Ignore the event if the status code is 204.
+        // This is a way to keep the runtime alive when
+        // there are no events pending to be processed.
+        return Ok(());
+    }
+
+    // Build the invocation such that it can be sent to the service right away
+    // when it is ready
+    let body = incoming.collect().await?.to_bytes();
+    let context = Context::new(invoke_request_id(&parts.headers)?, config.clone(), &parts.headers)?;
+    let invocation = LambdaInvocation { parts, body, context };
+
+    if set_amzn_trace_env {
+        // Setup Amazon's default tracing data
+        amzn_trace_env(&invocation.context);
+    } else {
+        // Inform users that X-Ray is available via context, not env var, in concurrent mode.
+        XRAY_LOGGED.get_or_init(|| {
+            trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
+        });
+    }
+
+    // Wait for service to be ready
+    let ready = service.ready().await?;
+
+    // Once ready, call the service which will respond to the Lambda runtime API
+    ready.call(invocation).await?;
+    Ok(())
 }
 
 fn amzn_trace_env(ctx: &Context) {
