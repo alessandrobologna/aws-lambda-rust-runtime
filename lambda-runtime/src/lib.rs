@@ -39,12 +39,8 @@ pub use lambda_runtime_api_client::tracing;
 /// Types available to a Lambda function.
 mod types;
 
-#[cfg(all(unix, feature = "graceful-shutdown"))]
-use crate::runtime::SHUTDOWN_NOTIFY;
 use requests::EventErrorRequest;
 pub use runtime::{LambdaInvocation, Runtime};
-#[cfg(all(unix, feature = "graceful-shutdown"))]
-use std::time::Duration;
 pub use types::{Context, FunctionResponse, IntoFunctionResponse, LambdaEvent, MetadataPrelude, StreamResponse};
 
 /// Error type that lambdas may result in
@@ -146,10 +142,30 @@ where
 /// Lambda Managed Instances (concurrent invocations).
 ///
 /// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
-/// will use a concurrent `/next` polling loop with a bounded number of
-/// in-flight handler tasks. When the environment variable is unset or `<= 1`,
-/// it falls back to the same sequential behavior as [`run`], so the same
-/// handler can run on both classic Lambda and Lambda Managed Instances.
+/// will spawn `AWS_LAMBDA_MAX_CONCURRENCY` worker tasks, each running its own
+/// `/next` polling loop. When the environment variable is unset or `<= 1`, it
+/// falls back to the same sequential behavior as [`run`], so the same handler
+/// can run on both classic Lambda and Lambda Managed Instances.
+///
+/// If you need more control over the runtime and add custom middleware, use the
+/// [Runtime] type directly.
+///
+/// # Example
+/// ```no_run
+/// use lambda_runtime::{Error, service_fn, LambdaEvent};
+/// use serde_json::Value;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Error> {
+///     let func = service_fn(func);
+///     lambda_runtime::run_concurrent(func).await?;
+///     Ok(())
+/// }
+///
+/// async fn func(event: LambdaEvent<Value>) -> Result<Value, Error> {
+///     Ok(event.payload)
+/// }
+/// ```
 pub async fn run_concurrent<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
 where
     F: Service<LambdaEvent<A>, Response = R> + Clone + Send + 'static,
@@ -251,26 +267,14 @@ where
                     eprintln!("[runtime] Graceful shutdown in progress ...");
                     shutdown_hook().await;
                     eprintln!("[runtime] Graceful shutdown completed");
-                    if let Some(tx) = SHUTDOWN_NOTIFY.get() {
-                        let _ = tx.send(true);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        std::process::exit(0);
-                    } else {
-                        std::process::exit(0);
-                    }
+                    std::process::exit(0);
                 },
                 _sigterm = sigterm.recv()=> {
                     eprintln!("[runtime] SIGTERM received");
                     eprintln!("[runtime] Graceful shutdown in progress ...");
                     shutdown_hook().await;
                     eprintln!("[runtime] Graceful shutdown completed");
-                    if let Some(tx) = SHUTDOWN_NOTIFY.get() {
-                        let _ = tx.send(true);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        std::process::exit(0);
-                    } else {
-                        std::process::exit(0);
-                    }
+                    std::process::exit(0);
                 },
             }
         };
