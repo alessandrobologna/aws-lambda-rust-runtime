@@ -219,8 +219,8 @@ where
 /// Lambda Managed Instances (concurrent invocations).
 ///
 /// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
-/// will use a concurrent `/next` polling loop with a bounded number of
-/// in-flight handler tasks. When the environment variable is unset or `<= 1`,
+/// will spawn `AWS_LAMBDA_MAX_CONCURRENCY` worker tasks, each running its own
+/// `/next` polling loop. When the environment variable is unset or `<= 1`,
 /// it falls back to the same sequential behavior as [`run`], so the same
 /// handler can run on both classic Lambda and Lambda Managed Instances.
 pub async fn run_concurrent<R, S, E>(handler: S) -> Result<(), Error>
