@@ -206,7 +206,9 @@ where
             remaining_workers = remaining_workers.saturating_sub(1);
             match result {
                 Ok(Ok(())) => {
-                    warn!(remaining_workers, "Concurrent worker exited unexpectedly");
+                    // `concurrent_worker_loop` runs indefinitely, so an Ok return indicates
+                    // an unexpected worker exit; we still decrement because the task is gone.
+                    warn!(remaining_workers, "Concurrent worker exited unexpectedly without error");
                 }
                 Ok(Err(err)) => {
                     if first_error.is_none() {
