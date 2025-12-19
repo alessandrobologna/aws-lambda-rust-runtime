@@ -12,6 +12,7 @@ use std::{
     env,
     fmt::Debug,
     future::Future,
+    io,
     sync::{Arc, OnceLock},
 };
 use tokio_stream::{Stream, StreamExt};
@@ -209,22 +210,24 @@ where
                     // `concurrent_worker_loop` runs indefinitely, so an Ok return indicates
                     // an unexpected worker exit; we still decrement because the task is gone.
                     warn!(remaining_workers, "Concurrent worker exited unexpectedly without error");
+                    if first_error.is_none() {
+                        first_error = Some(Box::new(io::Error::new(
+                            io::ErrorKind::Other,
+                            "all concurrent workers exited unexpectedly without error",
+                        )));
+                    }
                 }
                 Ok(Err(err)) => {
+                    error!(error = %err, remaining_workers, "Concurrent worker exited with error");
                     if first_error.is_none() {
-                        error!(error = %err, remaining_workers, "Concurrent worker exited with error");
                         first_error = Some(err);
-                    } else {
-                        error!(error = %err, remaining_workers, "Concurrent worker exited with error");
                     }
                 }
                 Err(join_err) => {
                     let err: BoxError = Box::new(join_err);
+                    error!(error = %err, remaining_workers, "Concurrent worker panicked");
                     if first_error.is_none() {
-                        error!(error = %err, remaining_workers, "Concurrent worker panicked");
                         first_error = Some(err);
-                    } else {
-                        error!(error = %err, remaining_workers, "Concurrent worker panicked");
                     }
                 }
             }
@@ -417,6 +420,7 @@ mod endpoint_tests {
         time::Duration,
     };
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
     use tokio_stream::StreamExt;
 
     #[tokio::test]
@@ -704,6 +708,7 @@ mod endpoint_tests {
     async fn concurrent_worker_crash_does_not_stop_other_workers() -> Result<(), Error> {
         let next_calls = Arc::new(AtomicUsize::new(0));
         let response_calls = Arc::new(AtomicUsize::new(0));
+        let first_error_served = Arc::new(Notify::new());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -712,6 +717,7 @@ mod endpoint_tests {
         let server_handle = {
             let next_calls = next_calls.clone();
             let response_calls = response_calls.clone();
+            let first_error_served = first_error_served.clone();
             tokio::spawn(async move {
                 loop {
                     let (tcp, _) = match listener.accept().await {
@@ -721,9 +727,11 @@ mod endpoint_tests {
 
                     let next_calls = next_calls.clone();
                     let response_calls = response_calls.clone();
+                    let first_error_served = first_error_served.clone();
                     let service = service_fn(move |req: Request<Incoming>| {
                         let next_calls = next_calls.clone();
                         let response_calls = response_calls.clone();
+                        let first_error_served = first_error_served.clone();
                         async move {
                             let (parts, body) = req.into_parts();
                             let method = parts.method;
@@ -737,8 +745,9 @@ mod endpoint_tests {
                             if method == Method::GET && path == "/2018-06-01/runtime/invocation/next" {
                                 let call_index = next_calls.fetch_add(1, Ordering::SeqCst);
                                 match call_index {
-                                    // First worker panics (missing request id header)
+                                    // First worker errors (missing request id header).
                                     0 => {
+                                        first_error_served.notify_one();
                                         let res = Response::builder()
                                             .status(StatusCode::OK)
                                             .header("lambda-runtime-deadline-ms", "1542409706888")
@@ -746,9 +755,9 @@ mod endpoint_tests {
                                             .unwrap();
                                         return Ok::<_, Infallible>(res);
                                     }
-                                    // Second worker should keep running and process an invocation, even after the first worker crashes.
+                                    // Second worker should keep running and process an invocation, even if another worker errors.
                                     1 => {
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        first_error_served.notified().await;
                                         let res = Response::builder()
                                             .status(StatusCode::OK)
                                             .header("content-type", "application/json")
@@ -758,7 +767,7 @@ mod endpoint_tests {
                                             .unwrap();
                                         return Ok::<_, Infallible>(res);
                                     }
-                                    // Finally, crash the remaining worker so the runtime can terminate and the test can assert behavior.
+                                    // Finally, error the remaining worker so the runtime can terminate and the test can assert behavior.
                                     2 => {
                                         let res = Response::builder()
                                             .status(StatusCode::OK)
