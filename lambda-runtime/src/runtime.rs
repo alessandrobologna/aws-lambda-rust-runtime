@@ -209,10 +209,13 @@ where
                 Ok(Ok(())) => {
                     // `concurrent_worker_loop` runs indefinitely, so an Ok return indicates
                     // an unexpected worker exit; we still decrement because the task is gone.
-                    warn!(remaining_workers, "Concurrent worker exited unexpectedly without error");
+                    warn!(
+                        remaining_workers,
+                        "Concurrent worker exited cleanly (unexpected - loop should run forever)"
+                    );
                     if first_error.is_none() {
                         first_error = Some(Box::new(io::Error::other(
-                            "all concurrent workers exited unexpectedly without error",
+                            "all concurrent workers exited cleanly (unexpected - loop should run forever)",
                         )));
                     }
                 }
