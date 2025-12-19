@@ -14,7 +14,6 @@ use std::{
     future::Future,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::watch;
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
 use tracing::{error, trace, warn};
@@ -181,7 +180,6 @@ where
         max_concurrency: u32,
     ) -> Result<(), BoxError> {
         let limit = max_concurrency as usize;
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut workers = FuturesUnordered::new();
         for _ in 1..limit {
@@ -189,42 +187,42 @@ where
                 service.clone(),
                 config.clone(),
                 client.clone(),
-                shutdown_rx.clone(),
             )));
         }
-        workers.push(tokio::spawn(concurrent_worker_loop(
-            service,
-            config,
-            client,
-            shutdown_rx,
-        )));
+        workers.push(tokio::spawn(concurrent_worker_loop(service, config, client)));
 
-        // Track the first infrastructure error to return as the result.
-        // Note: Handler errors (Err returned from user code) do NOT trigger this;
-        // they are reported to Lambda via /invocation/{id}/error and the worker
+        // Track the first infrastructure error. A single worker failing should
+        // not terminate the whole runtime (LMI keeps running with the remaining
+        // healthy workers). We only return an error once there are no workers
+        // left (i.e., we cannot keep at least 1 worker alive).
+        //
+        // Note: Handler errors (Err returned from user code) do NOT trigger this.
+        // They are reported to Lambda via /invocation/{id}/error and the worker
         // continues. This only captures unrecoverable runtime failures like
-        // network errors, API client failures, or worker panics.
+        // API client failures, runtime panics, etc.
         let mut first_error: Option<BoxError> = None;
+        let mut remaining_workers = limit;
         while let Some(result) = futures::StreamExt::next(&mut workers).await {
+            remaining_workers = remaining_workers.saturating_sub(1);
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    warn!(remaining_workers, "Concurrent worker exited unexpectedly");
+                }
                 Ok(Err(err)) => {
                     if first_error.is_none() {
-                        error!(error = %err, "Concurrent worker exited with error; shutting down");
-                        let _ = shutdown_tx.send(true);
+                        error!(error = %err, remaining_workers, "Concurrent worker exited with error");
                         first_error = Some(err);
                     } else {
-                        error!(error = %err, "Concurrent worker exited with error");
+                        error!(error = %err, remaining_workers, "Concurrent worker exited with error");
                     }
                 }
                 Err(join_err) => {
                     let err: BoxError = Box::new(join_err);
                     if first_error.is_none() {
-                        error!(error = %err, "Concurrent worker panicked; shutting down");
-                        let _ = shutdown_tx.send(true);
+                        error!(error = %err, remaining_workers, "Concurrent worker panicked");
                         first_error = Some(err);
                     } else {
-                        error!(error = %err, "Concurrent worker panicked");
+                        error!(error = %err, remaining_workers, "Concurrent worker panicked");
                     }
                 }
             }
@@ -316,47 +314,22 @@ async fn next_event_future(client: Arc<ApiClient>) -> Result<http::Response<hype
     client.call(req).await
 }
 
-async fn concurrent_worker_loop<S>(
-    mut service: S,
-    config: Arc<Config>,
-    client: Arc<ApiClient>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<(), BoxError>
+async fn concurrent_worker_loop<S>(mut service: S, config: Arc<Config>, client: Arc<ApiClient>) -> Result<(), BoxError>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError>,
     S::Future: Send,
 {
     loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        tokio::select! {
-            changed = shutdown_rx.changed() => {
-                match changed {
-                    Ok(()) => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+        let event = match next_event_future(client.clone()).await {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(error = %e, "Error polling /next, retrying");
+                continue;
             }
-            result = next_event_future(client.clone()) => {
-                let event = match result {
-                    Ok(event) => event,
-                    Err(e) => {
-                        warn!(error = %e, "Error polling /next, retrying");
-                        continue;
-                    }
-                };
+        };
 
-                process_invocation(&mut service, &config, event, false).await?;
-            }
-        }
+        process_invocation(&mut service, &config, event, false).await?;
     }
-
-    Ok(())
 }
 
 async fn process_invocation<S>(
@@ -420,13 +393,28 @@ mod endpoint_tests {
         requests::{EventCompletionRequest, EventErrorRequest, IntoRequest, NextEventRequest},
         Config, Diagnostic, Error, Runtime,
     };
+    use bytes::Bytes;
     use futures::future::BoxFuture;
-    use http::{HeaderValue, StatusCode};
-    use http_body_util::BodyExt;
+    use http::{HeaderValue, Method, Request, Response, StatusCode};
+    use http_body_util::{BodyExt, Full};
     use httpmock::prelude::*;
 
+    use hyper::{body::Incoming, service::service_fn};
+    use hyper_util::{
+        rt::{tokio::TokioIo, TokioExecutor},
+        server::conn::auto::Builder as ServerBuilder,
+    };
     use lambda_runtime_api_client::Client;
-    use std::{env, sync::Arc};
+    use std::{
+        convert::Infallible,
+        env,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::net::TcpListener;
     use tokio_stream::StreamExt;
 
     #[tokio::test]
@@ -708,5 +696,148 @@ mod endpoint_tests {
         } else {
             env::remove_var("AWS_LAMBDA_MAX_CONCURRENCY");
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_worker_crash_does_not_stop_other_workers() -> Result<(), Error> {
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base: http::Uri = format!("http://{addr}").parse().unwrap();
+
+        let server_handle = {
+            let next_calls = next_calls.clone();
+            let response_calls = response_calls.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+
+                    let next_calls = next_calls.clone();
+                    let response_calls = response_calls.clone();
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let next_calls = next_calls.clone();
+                        let response_calls = response_calls.clone();
+                        async move {
+                            let (parts, body) = req.into_parts();
+                            let method = parts.method;
+                            let path = parts.uri.path().to_string();
+
+                            if method == Method::POST {
+                                // Drain request body to support keep-alive.
+                                let _ = body.collect().await;
+                            }
+
+                            if method == Method::GET && path == "/2018-06-01/runtime/invocation/next" {
+                                let call_index = next_calls.fetch_add(1, Ordering::SeqCst);
+                                match call_index {
+                                    // First worker panics (missing request id header)
+                                    0 => {
+                                        let res = Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("lambda-runtime-deadline-ms", "1542409706888")
+                                            .body(Full::new(Bytes::from_static(b"{}")))
+                                            .unwrap();
+                                        return Ok::<_, Infallible>(res);
+                                    }
+                                    // Second worker should keep running and process an invocation, even after the first worker crashes.
+                                    1 => {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        let res = Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("content-type", "application/json")
+                                            .header("lambda-runtime-aws-request-id", "good-request")
+                                            .header("lambda-runtime-deadline-ms", "1542409706888")
+                                            .body(Full::new(Bytes::from_static(b"{}")))
+                                            .unwrap();
+                                        return Ok::<_, Infallible>(res);
+                                    }
+                                    // Finally, crash the remaining worker so the runtime can terminate and the test can assert behavior.
+                                    2 => {
+                                        let res = Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("lambda-runtime-deadline-ms", "1542409706888")
+                                            .body(Full::new(Bytes::from_static(b"{}")))
+                                            .unwrap();
+                                        return Ok::<_, Infallible>(res);
+                                    }
+                                    _ => {
+                                        let res = Response::builder()
+                                            .status(StatusCode::NO_CONTENT)
+                                            .body(Full::new(Bytes::new()))
+                                            .unwrap();
+                                        return Ok::<_, Infallible>(res);
+                                    }
+                                }
+                            }
+
+                            if method == Method::POST && path.ends_with("/response") {
+                                response_calls.fetch_add(1, Ordering::SeqCst);
+                                let res = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap();
+                                return Ok::<_, Infallible>(res);
+                            }
+
+                            let res = Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap();
+                            Ok::<_, Infallible>(res)
+                        }
+                    });
+
+                    let io = TokioIo::new(tcp);
+                    tokio::spawn(async move {
+                        if let Err(err) = ServerBuilder::new(TokioExecutor::new())
+                            .serve_connection(io, service)
+                            .await
+                        {
+                            eprintln!("Error serving connection: {err:?}");
+                        }
+                    });
+                }
+            })
+        };
+
+        async fn func(event: crate::LambdaEvent<serde_json::Value>) -> Result<serde_json::Value, Error> {
+            Ok(event.payload)
+        }
+
+        let handler = crate::service_fn(func);
+        let client = Arc::new(Client::builder().with_endpoint(base).build()?);
+        let runtime = Runtime {
+            client: client.clone(),
+            config: Arc::new(Config {
+                function_name: "test_fn".to_string(),
+                memory: 128,
+                version: "1".to_string(),
+                log_stream: "test_stream".to_string(),
+                log_group: "test_log".to_string(),
+                max_concurrency: Some(2),
+            }),
+            service: wrap_handler(handler, client),
+        };
+
+        let res = tokio::time::timeout(Duration::from_secs(2), runtime.run_concurrent()).await;
+        assert!(res.is_ok(), "run_concurrent timed out");
+        assert!(
+            res.unwrap().is_err(),
+            "expected runtime to terminate once all workers crashed"
+        );
+
+        assert_eq!(
+            response_calls.load(Ordering::SeqCst),
+            1,
+            "expected remaining worker to keep running after a worker crash"
+        );
+
+        server_handle.abort();
+        Ok(())
     }
 }
