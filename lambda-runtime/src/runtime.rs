@@ -60,6 +60,7 @@ pub struct Runtime<S> {
     service: S,
     config: Arc<Config>,
     client: Arc<ApiClient>,
+    concurrency_limit: u32,
 }
 
 /// One-time marker to log X-Ray behavior in concurrent mode.
@@ -102,7 +103,9 @@ where
     pub fn new(handler: F) -> Self {
         trace!("Loading config from env");
         let config = Arc::new(Config::from_env());
-        let pool_size = config.max_concurrency.unwrap_or(1).max(1) as usize;
+        let concurrency_limit = max_concurrency_from_env().unwrap_or(1).max(1);
+        // Strategy: allocate all worker tasks up-front, so size the client pool to match.
+        let pool_size = concurrency_limit as usize;
         let client = Arc::new(
             ApiClient::builder()
                 .with_pool_size(pool_size)
@@ -113,6 +116,7 @@ where
             service: wrap_handler(handler, client.clone()),
             config,
             client,
+            concurrency_limit,
         }
     }
 }
@@ -149,6 +153,7 @@ impl<S> Runtime<S> {
             client: self.client,
             config: self.config,
             service: layer.layer(self.service),
+            concurrency_limit: self.concurrency_limit,
         }
     }
 }
@@ -164,9 +169,8 @@ where
     /// sequential `run_with_incoming` loop so that the same handler can run on both
     /// classic Lambda and Lambda Managed Instances.
     pub async fn run_concurrent(self) -> Result<(), BoxError> {
-        if self.config.is_concurrent() {
-            let max_concurrency = self.config.max_concurrency.unwrap_or(1);
-            Self::run_concurrent_inner(self.service, self.config, self.client, max_concurrency).await
+        if self.concurrency_limit > 1 {
+            Self::run_concurrent_inner(self.service, self.config, self.client, self.concurrency_limit).await
         } else {
             let incoming = incoming(&self.client);
             Self::run_with_incoming(self.service, self.config, incoming).await
@@ -178,9 +182,9 @@ where
         service: S,
         config: Arc<Config>,
         client: Arc<ApiClient>,
-        max_concurrency: u32,
+        concurrency_limit: u32,
     ) -> Result<(), BoxError> {
-        let limit = max_concurrency as usize;
+        let limit = concurrency_limit as usize;
 
         let mut workers = FuturesUnordered::new();
         for _ in 1..limit {
@@ -319,6 +323,13 @@ fn incoming(
 async fn next_event_future(client: Arc<ApiClient>) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
     let req = NextEventRequest.into_req()?;
     client.call(req).await
+}
+
+fn max_concurrency_from_env() -> Option<u32> {
+    env::var("AWS_LAMBDA_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&c| c > 0)
 }
 
 async fn concurrent_worker_loop<S>(mut service: S, config: Arc<Config>, client: Arc<ApiClient>) -> Result<(), BoxError>
@@ -573,6 +584,7 @@ mod endpoint_tests {
             client: client.clone(),
             config: Arc::new(config),
             service: wrap_handler(f, client),
+            concurrency_limit: 1,
         };
         let client = &runtime.client;
         let incoming = incoming(client).take(1);
@@ -620,7 +632,6 @@ mod endpoint_tests {
             version: "1".to_string(),
             log_stream: "test_stream".to_string(),
             log_group: "test_log".to_string(),
-            max_concurrency: None,
         });
 
         let client = Arc::new(client);
@@ -628,6 +639,7 @@ mod endpoint_tests {
             client: client.clone(),
             config,
             service: wrap_handler(f, client),
+            concurrency_limit: 1,
         };
         let client = &runtime.client;
         let incoming = incoming(client).take(1);
@@ -649,60 +661,6 @@ mod endpoint_tests {
             panic!("This is intentionally here");
         })
         .await
-    }
-
-    #[test]
-    fn config_parses_max_concurrency() {
-        // Preserve existing env values
-        let prev_fn = env::var("AWS_LAMBDA_FUNCTION_NAME").ok();
-        let prev_mem = env::var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE").ok();
-        let prev_ver = env::var("AWS_LAMBDA_FUNCTION_VERSION").ok();
-        let prev_log_stream = env::var("AWS_LAMBDA_LOG_STREAM_NAME").ok();
-        let prev_log_group = env::var("AWS_LAMBDA_LOG_GROUP_NAME").ok();
-        let prev_max = env::var("AWS_LAMBDA_MAX_CONCURRENCY").ok();
-
-        env::set_var("AWS_LAMBDA_FUNCTION_NAME", "test_fn");
-        env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "128");
-        env::set_var("AWS_LAMBDA_FUNCTION_VERSION", "1");
-        env::set_var("AWS_LAMBDA_LOG_STREAM_NAME", "test_stream");
-        env::set_var("AWS_LAMBDA_LOG_GROUP_NAME", "test_log");
-        env::set_var("AWS_LAMBDA_MAX_CONCURRENCY", "4");
-
-        let cfg = Config::from_env();
-        assert_eq!(cfg.max_concurrency, Some(4));
-        assert!(cfg.is_concurrent());
-
-        // Restore env
-        if let Some(v) = prev_fn {
-            env::set_var("AWS_LAMBDA_FUNCTION_NAME", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_FUNCTION_NAME");
-        }
-        if let Some(v) = prev_mem {
-            env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-        }
-        if let Some(v) = prev_ver {
-            env::set_var("AWS_LAMBDA_FUNCTION_VERSION", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_FUNCTION_VERSION");
-        }
-        if let Some(v) = prev_log_stream {
-            env::set_var("AWS_LAMBDA_LOG_STREAM_NAME", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_LOG_STREAM_NAME");
-        }
-        if let Some(v) = prev_log_group {
-            env::set_var("AWS_LAMBDA_LOG_GROUP_NAME", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_LOG_GROUP_NAME");
-        }
-        if let Some(v) = prev_max {
-            env::set_var("AWS_LAMBDA_MAX_CONCURRENCY", v);
-        } else {
-            env::remove_var("AWS_LAMBDA_MAX_CONCURRENCY");
-        }
     }
 
     #[tokio::test]
@@ -831,9 +789,9 @@ mod endpoint_tests {
                 version: "1".to_string(),
                 log_stream: "test_stream".to_string(),
                 log_group: "test_log".to_string(),
-                max_concurrency: Some(2),
             }),
             service: wrap_handler(handler, client),
+            concurrency_limit: 2,
         };
 
         let res = tokio::time::timeout(Duration::from_secs(2), runtime.run_concurrent()).await;

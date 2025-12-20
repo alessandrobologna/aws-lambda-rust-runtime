@@ -59,9 +59,6 @@ pub struct Config {
     pub log_stream: String,
     /// The name of the Amazon CloudWatch Logs group for the function.
     pub log_group: String,
-    /// Maximum concurrent invocations for Lambda managed-concurrency environments.
-    /// Populated from `AWS_LAMBDA_MAX_CONCURRENCY` when present.
-    pub max_concurrency: Option<u32>,
 }
 
 type RefConfig = Arc<Config>;
@@ -78,16 +75,7 @@ impl Config {
             version: env::var("AWS_LAMBDA_FUNCTION_VERSION").expect("Missing AWS_LAMBDA_FUNCTION_VERSION env var"),
             log_stream: env::var("AWS_LAMBDA_LOG_STREAM_NAME").unwrap_or_default(),
             log_group: env::var("AWS_LAMBDA_LOG_GROUP_NAME").unwrap_or_default(),
-            max_concurrency: env::var("AWS_LAMBDA_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|&c| c > 0),
         }
-    }
-
-    /// Returns true if concurrent runtime mode should be enabled.
-    pub fn is_concurrent(&self) -> bool {
-        self.max_concurrency.map(|c| c > 1).unwrap_or(false)
     }
 }
 
