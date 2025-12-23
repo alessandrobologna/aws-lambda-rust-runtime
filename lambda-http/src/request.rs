@@ -146,7 +146,6 @@ fn into_api_gateway_v2_request(ag: ApiGatewayV2httpRequest) -> http::Request<Bod
         .extension(RequestContext::ApiGatewayV2(ag.request_context));
 
     let mut headers = ag.headers;
-    update_xray_trace_id_header(&mut headers);
     if let Some(cookies) = ag.cookies {
         if let Ok(header_value) = HeaderValue::from_str(&cookies.join(";")) {
             headers.insert(http::header::COOKIE, header_value);
@@ -170,13 +169,6 @@ fn into_api_gateway_v2_request(ag: ApiGatewayV2httpRequest) -> http::Request<Bod
     req
 }
 
-fn update_xray_trace_id_header(headers: &mut HeaderMap) {
-    if let Ok(xray_trace_id) = env::var("_X_AMZN_TRACE_ID") {
-        if let Ok(header_value) = HeaderValue::from_str(&xray_trace_id) {
-            headers.insert(HeaderName::from_static("x-amzn-trace-id"), header_value);
-        }
-    }
-}
 #[cfg(feature = "apigw_rest")]
 fn into_proxy_request(ag: ApiGatewayProxyRequest) -> http::Request<Body> {
     let http_method = ag.http_method;
@@ -214,7 +206,6 @@ fn into_proxy_request(ag: ApiGatewayProxyRequest) -> http::Request<Body> {
     // multi-value_headers our cannoncial source of request headers
     let mut headers = ag.multi_value_headers;
     headers.extend(ag.headers);
-    update_xray_trace_id_header(&mut headers);
 
     let base64 = ag.is_base64_encoded;
     let mut req = builder
@@ -265,7 +256,6 @@ fn into_alb_request(alb: AlbTargetGroupRequest) -> http::Request<Body> {
     // multi-value_headers our cannoncial source of request headers
     let mut headers = alb.multi_value_headers;
     headers.extend(alb.headers);
-    update_xray_trace_id_header(&mut headers);
 
     let base64 = alb.is_base64_encoded;
 
@@ -330,7 +320,6 @@ fn into_websocket_request(ag: ApiGatewayWebsocketProxyRequest) -> http::Request<
     // multi-value_headers our canonical source of request headers
     let mut headers = ag.multi_value_headers;
     headers.extend(ag.headers);
-    update_xray_trace_id_header(&mut headers);
 
     let base64 = ag.is_base64_encoded;
     let mut req = builder
@@ -354,8 +343,6 @@ fn into_pass_through_request(data: String) -> http::Request<Body> {
 
     let headers = builder.headers_mut().unwrap();
     headers.insert("Content-Type", "application/json".parse().unwrap());
-
-    update_xray_trace_id_header(headers);
 
     let raw_path = "/events";
 

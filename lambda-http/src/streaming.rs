@@ -1,4 +1,6 @@
-use crate::{http::header::SET_COOKIE, request::LambdaRequest, Request, RequestExt};
+use crate::{
+    http::header::SET_COOKIE, request::LambdaRequest, update_xray_trace_id_header_from_context, Request, RequestExt,
+};
 use bytes::Bytes;
 use core::{
     fmt::Debug,
@@ -60,10 +62,12 @@ where
     }
 
     fn call(&mut self, req: LambdaEvent<LambdaRequest>) -> Self::Future {
-        let event: Request = req.payload.into();
+        let LambdaEvent { payload, context } = req;
+        let mut event: Request = payload.into();
+        update_xray_trace_id_header_from_context(event.headers_mut(), &context);
         Box::pin(
             self.service
-                .call(event.with_lambda_context(req.context))
+                .call(event.with_lambda_context(context))
                 .map_ok(into_stream_response),
         )
     }
@@ -148,8 +152,10 @@ where
 }
 
 fn event_to_request(req: LambdaEvent<LambdaRequest>) -> Request {
-    let event: Request = req.payload.into();
-    event.with_lambda_context(req.context)
+    let LambdaEvent { payload, context } = req;
+    let mut event: Request = payload.into();
+    update_xray_trace_id_header_from_context(event.headers_mut(), &context);
+    event.with_lambda_context(context)
 }
 
 /// Runs the Lambda runtime with a handler that returns **streaming** HTTP

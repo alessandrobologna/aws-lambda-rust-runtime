@@ -192,9 +192,11 @@ where
     }
 
     fn call(&mut self, req: LambdaEvent<LambdaRequest>) -> Self::Future {
-        let request_origin = req.payload.request_origin();
-        let event: Request = req.payload.into();
-        let fut = Box::pin(self.service.call(event.with_lambda_context(req.context)));
+        let LambdaEvent { payload, context } = req;
+        let request_origin = payload.request_origin();
+        let mut event: Request = payload.into();
+        update_xray_trace_id_header_from_context(event.headers_mut(), &context);
+        let fut = Box::pin(self.service.call(event.with_lambda_context(context)));
 
         TransformResponse::Request(request_origin, fut)
     }
@@ -231,6 +233,15 @@ where
     E: std::fmt::Debug + Into<Diagnostic> + Send + 'static,
 {
     lambda_runtime::run_concurrent(Adapter::from(handler)).await
+}
+
+// Replaces update_xray_trace_id_header (env var), now set from Context
+fn update_xray_trace_id_header_from_context(headers: &mut http::HeaderMap, context: &Context) {
+    if let Some(trace_id) = context.xray_trace_id.as_deref() {
+        if let Ok(header_value) = http::HeaderValue::from_str(trace_id) {
+            headers.insert(http::header::HeaderName::from_static("x-amzn-trace-id"), header_value);
+        }
+    }
 }
 
 #[cfg(test)]
