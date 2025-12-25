@@ -207,6 +207,12 @@ where
 ///
 /// This takes care of transforming the LambdaEvent into a [`Request`] and then
 /// converting the result into a `LambdaResponse`.
+///
+/// # Managed concurrency
+/// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
+/// it does not enable concurrent polling. If your handler can satisfy `Clone`,
+/// prefer [`run_concurrent`], which honors managed concurrency and falls back to
+/// sequential behavior when unset.
 pub async fn run<'a, R, S, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = R, Error = E>,

@@ -120,6 +120,10 @@ impl ClientBuilder {
     }
 
     /// Provide a pool size hint for the underlying Hyper client.
+    ///
+    /// When using concurrent polling, this should be at least the maximum
+    /// concurrency (e.g., `AWS_LAMBDA_MAX_CONCURRENCY`) to avoid connection
+    /// starvation.
     pub fn with_pool_size(self, pool_size: usize) -> Self {
         Self {
             pool_size: Some(pool_size),

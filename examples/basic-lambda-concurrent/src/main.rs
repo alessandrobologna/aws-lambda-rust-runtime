@@ -29,7 +29,7 @@ async fn main() -> Result<(), Error> {
 
     let func = service_fn(my_handler);
     if let Err(err) = lambda_runtime::run_concurrent(func).await {
-        eprintln!("run error: {:?}", err);
+        tracing::error!(error = %err, "run error");
         return Err(err);
     }
     Ok(())

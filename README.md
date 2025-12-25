@@ -405,6 +405,12 @@ make test-rie EXAMPLE=basic-sqs
 make test-rie EXAMPLE=http-basic-lambda
 ```
 
+To test Lambda Managed Instances (concurrent polling), use:
+
+```bash
+make test-rie-lmi EXAMPLE=basic-lambda-concurrent
+```
+
 This command will:
 1. Build a Docker image with Rust toolchain and RIE
 2. Compile the specified example inside the Linux container

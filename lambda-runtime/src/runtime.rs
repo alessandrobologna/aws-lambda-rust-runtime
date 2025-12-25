@@ -4,20 +4,14 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
-use futures::stream::FuturesUnordered;
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
-use std::{
-    env,
-    fmt::Debug,
-    future::Future,
-    io,
-    sync::{Arc, OnceLock},
-};
+use std::{env, fmt, fmt::Debug, future::Future, io, sync::Arc};
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
-use tracing::{error, trace, warn};
+use tracing::{error, info_span, trace, warn, Instrument};
 
 /* ----------------------------------------- INVOCATION ---------------------------------------- */
 
@@ -62,9 +56,6 @@ pub struct Runtime<S> {
     client: Arc<ApiClient>,
     concurrency_limit: u32,
 }
-
-/// One-time marker to log X-Ray behavior in concurrent mode.
-static XRAY_LOGGED: OnceLock<()> = OnceLock::new();
 
 impl<F, EventPayload, Response, BufferedResponse, StreamingResponse, StreamItem, StreamError>
     Runtime<
@@ -170,6 +161,7 @@ where
     /// classic Lambda and Lambda Managed Instances.
     pub async fn run_concurrent(self) -> Result<(), BoxError> {
         if self.concurrency_limit > 1 {
+            trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
             Self::run_concurrent_inner(self.service, self.config, self.client, self.concurrency_limit).await
         } else {
             let incoming = incoming(&self.client);
@@ -186,18 +178,22 @@ where
     ) -> Result<(), BoxError> {
         let limit = concurrency_limit as usize;
 
-        let mut workers = FuturesUnordered::new();
+        // Use FuturesUnordered so we can observe worker exits as they happen,
+        // rather than waiting for all workers to finish (join_all).
+        let mut workers: FuturesUnordered<WorkerJoinFuture> = FuturesUnordered::new();
+        let spawn_worker = |service: S, config: Arc<Config>, client: Arc<ApiClient>| -> WorkerJoinFuture {
+            let handle = tokio::spawn(concurrent_worker_loop(service, config, client));
+            let task_id = handle.id();
+            Box::pin(async move { (task_id, handle.await) })
+        };
+        // Spawn one worker per concurrency slot; the last uses the owned service to avoid an extra clone.
         for _ in 1..limit {
-            workers.push(tokio::spawn(concurrent_worker_loop(
-                service.clone(),
-                config.clone(),
-                client.clone(),
-            )));
+            workers.push(spawn_worker(service.clone(), config.clone(), client.clone()));
         }
-        workers.push(tokio::spawn(concurrent_worker_loop(service, config, client)));
+        workers.push(spawn_worker(service, config, client));
 
-        // Track the first infrastructure error. A single worker failing should
-        // not terminate the whole runtime (LMI keeps running with the remaining
+        // Track worker exits across tasks. A single worker failing should not
+        // terminate the whole runtime (LMI keeps running with the remaining
         // healthy workers). We only return an error once there are no workers
         // left (i.e., we cannot keep at least 1 worker alive).
         //
@@ -205,53 +201,121 @@ where
         // They are reported to Lambda via /invocation/{id}/error and the worker
         // continues. This only captures unrecoverable runtime failures like
         // API client failures, runtime panics, etc.
-        let mut first_error: Option<BoxError> = None;
+        let mut errors: Vec<WorkerError> = Vec::new();
         let mut remaining_workers = limit;
-        while let Some(result) = futures::StreamExt::next(&mut workers).await {
+        while let Some((task_id, result)) = futures::StreamExt::next(&mut workers).await {
             remaining_workers = remaining_workers.saturating_sub(1);
             match result {
                 Ok(Ok(())) => {
                     // `concurrent_worker_loop` runs indefinitely, so an Ok return indicates
                     // an unexpected worker exit; we still decrement because the task is gone.
-                    warn!(
+                    let clean_exit_msg = "Concurrent worker exited cleanly (unexpected - loop should run forever)";
+                    error!(
+                        task_id = %task_id,
                         remaining_workers,
-                        "Concurrent worker exited cleanly (unexpected - loop should run forever)"
+                        "{}",
+                        clean_exit_msg
                     );
-                    if first_error.is_none() {
-                        first_error = Some(Box::new(io::Error::other(
-                            "all concurrent workers exited cleanly (unexpected - loop should run forever)",
-                        )));
-                    }
+                    errors.push(WorkerError::CleanExit(task_id));
                 }
                 Ok(Err(err)) => {
-                    error!(error = %err, remaining_workers, "Concurrent worker exited with error");
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                    error!(
+                        task_id = %task_id,
+                        error = %err,
+                        remaining_workers,
+                        "Concurrent worker exited with error"
+                    );
+                    errors.push(WorkerError::Failure(task_id, err));
                 }
                 Err(join_err) => {
                     let err: BoxError = Box::new(join_err);
-                    error!(error = %err, remaining_workers, "Concurrent worker panicked");
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                    error!(
+                        task_id = %task_id,
+                        error = %err,
+                        remaining_workers,
+                        "Concurrent worker panicked"
+                    );
+                    errors.push(WorkerError::Failure(task_id, err));
                 }
             }
         }
 
-        match first_error {
-            Some(err) => Err(err),
-            None => Ok(()),
+        match errors.len() {
+            0 => Ok(()),
+            _ => Err(Box::new(ConcurrentWorkerErrors { errors })),
         }
     }
 }
+
+#[derive(Debug)]
+enum WorkerError {
+    CleanExit(tokio::task::Id),
+    Failure(tokio::task::Id, BoxError),
+}
+
+type WorkerJoinResult = (tokio::task::Id, Result<Result<(), BoxError>, tokio::task::JoinError>);
+type WorkerJoinFuture = BoxFuture<'static, WorkerJoinResult>;
+
+#[derive(Debug)]
+struct ConcurrentWorkerErrors {
+    errors: Vec<WorkerError>,
+}
+
+impl fmt::Display for ConcurrentWorkerErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut clean = Vec::new();
+        let mut failures = Vec::new();
+        for error in &self.errors {
+            match error {
+                WorkerError::CleanExit(task_id) => clean.push(task_id),
+                WorkerError::Failure(task_id, err) => failures.push((task_id, err)),
+            }
+        }
+
+        if failures.is_empty() && !clean.is_empty() {
+            write!(
+                f,
+                "all concurrent workers exited cleanly (unexpected - loop should run forever)"
+            )?;
+            for task_id in clean {
+                write!(f, " [task {task_id}]")?;
+            }
+            return Ok(());
+        }
+
+        write!(f, "concurrent workers exited unexpectedly")?;
+        if !clean.is_empty() {
+            write!(f, "; clean exits:")?;
+            for task_id in clean {
+                write!(f, " [task {task_id}]")?;
+            }
+        }
+        if !failures.is_empty() {
+            write!(f, "; failures:")?;
+            for (task_id, err) in failures {
+                write!(f, " [task {task_id}] {err}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConcurrentWorkerErrors {}
 
 impl<S> Runtime<S>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError>,
 {
     /// Start the runtime and begin polling for events on the Lambda Runtime API.
+    ///
+    /// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this returns an error because it does not enable
+    /// concurrent polling. Use [`Runtime::run_concurrent`] instead.
     pub async fn run(self) -> Result<(), BoxError> {
+        if let Some(raw) = concurrency_env_value() {
+            return Err(Box::new(io::Error::other(format!(
+                "AWS_LAMBDA_MAX_CONCURRENCY is set to '{raw}', but Runtime::run does not support concurrent polling; use Runtime::run_concurrent instead"
+            ))));
+        }
         let incoming = incoming(&self.client);
         Self::run_with_incoming(self.service, self.config, incoming).await
     }
@@ -332,21 +396,29 @@ fn max_concurrency_from_env() -> Option<u32> {
         .filter(|&c| c > 0)
 }
 
+fn concurrency_env_value() -> Option<String> {
+    env::var("AWS_LAMBDA_MAX_CONCURRENCY").ok()
+}
+
 async fn concurrent_worker_loop<S>(mut service: S, config: Arc<Config>, client: Arc<ApiClient>) -> Result<(), BoxError>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError>,
     S::Future: Send,
 {
+    let task_id = tokio::task::id();
+    let span = info_span!("concurrent_worker_loop", task_id = %task_id);
     loop {
         let event = match next_event_future(client.clone()).await {
             Ok(event) => event,
             Err(e) => {
-                warn!(error = %e, "Error polling /next, retrying");
+                warn!(task_id = %task_id, error = %e, "Error polling /next, retrying");
                 continue;
             }
         };
 
-        process_invocation(&mut service, &config, event, false).await?;
+        process_invocation(&mut service, &config, event, false)
+            .instrument(span.clone())
+            .await?;
     }
 }
 
@@ -378,11 +450,6 @@ where
     if set_amzn_trace_env {
         // Setup Amazon's default tracing data
         amzn_trace_env(&invocation.context);
-    } else {
-        // Inform users that X-Ray is available via context, not env var, in concurrent mode.
-        XRAY_LOGGED.get_or_init(|| {
-            trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
-        });
     }
 
     // Wait for service to be ready

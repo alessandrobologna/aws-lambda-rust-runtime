@@ -94,6 +94,12 @@ where
 /// If you need more control over the runtime and add custom middleware, use the
 /// [Runtime] type directly.
 ///
+/// # Managed concurrency
+/// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
+/// it does not enable concurrent polling. If your handler can satisfy `Clone`,
+/// prefer [`run_concurrent`], which honors managed concurrency and falls back to
+/// sequential behavior when unset.
+///
 /// # Example
 /// ```no_run
 /// use lambda_runtime::{Error, service_fn, LambdaEvent};

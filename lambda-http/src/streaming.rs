@@ -12,7 +12,7 @@ pub use http::{self, Response};
 use http_body::Body;
 use lambda_runtime::{
     tower::{
-        util::{BoxCloneService, MapRequest, MapResponse},
+        util::{MapRequest, MapResponse},
         ServiceBuilder, ServiceExt,
     },
     Diagnostic,
@@ -27,6 +27,18 @@ use std::{future::Future, marker::PhantomData};
 pub struct StreamAdapter<'a, S, B> {
     service: S,
     _phantom_data: PhantomData<&'a B>,
+}
+
+impl<'a, S, B> Clone for StreamAdapter<'a, S, B>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            _phantom_data: PhantomData,
+        }
+    }
 }
 
 impl<'a, S, B, E> From<S> for StreamAdapter<'a, S, B>
@@ -104,10 +116,12 @@ where
 
 /// Builds a streaming-aware Tower service from a `Service<Request>` that can be
 /// cloned and sent across tasks. This is used by the concurrent HTTP entrypoint.
+type EventToRequest = fn(LambdaEvent<LambdaRequest>) -> Request;
+
 #[allow(clippy::type_complexity)]
-fn into_stream_service_boxed<S, B, E>(
+fn into_stream_service_cloneable<S, B, E>(
     handler: S,
-) -> BoxCloneService<LambdaEvent<LambdaRequest>, StreamResponse<BodyStream<B>>, E>
+) -> MapResponse<MapRequest<S, EventToRequest>, impl FnOnce(Response<B>) -> StreamResponse<BodyStream<B>> + Clone>
 where
     S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,
     S::Future: Send + 'static,
@@ -116,12 +130,10 @@ where
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,
 {
-    let svc = ServiceBuilder::new()
-        .map_request(event_to_request as fn(LambdaEvent<LambdaRequest>) -> Request)
+    ServiceBuilder::new()
+        .map_request(event_to_request as EventToRequest)
         .service(handler)
-        .map_response(into_stream_response);
-
-    BoxCloneService::new(svc)
+        .map_response(into_stream_response)
 }
 
 /// Converts an `http::Response<B>` into a streaming Lambda response.
@@ -163,6 +175,11 @@ fn event_to_request(req: LambdaEvent<LambdaRequest>) -> Request {
 ///
 /// See the [AWS docs for response streaming].
 ///
+/// # Managed concurrency
+/// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
+/// it does not enable concurrent polling. Use [`run_with_streaming_response_concurrent`]
+/// instead.
+///
 /// [AWS docs for response streaming]:
 ///     https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html
 pub async fn run_with_streaming_response<'a, S, B, E>(handler: S) -> Result<(), Error>
@@ -192,7 +209,7 @@ where
     B::Data: Into<Bytes> + Send,
     B::Error: Into<Error> + Send + Debug,
 {
-    lambda_runtime::run_concurrent(into_stream_service_boxed(handler)).await
+    lambda_runtime::run_concurrent(into_stream_service_cloneable(handler)).await
 }
 
 pin_project_lite::pin_project! {
