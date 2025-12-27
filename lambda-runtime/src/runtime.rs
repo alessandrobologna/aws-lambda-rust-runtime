@@ -4,14 +4,14 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
-use futures::{future::BoxFuture, stream::FuturesUnordered};
+use futures::stream::FuturesUnordered;
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
 use std::{env, fmt, fmt::Debug, future::Future, io, sync::Arc};
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
-use tracing::{error, info_span, trace, warn, Instrument};
+use tracing::{debug, error, info_span, trace, warn, Instrument};
 
 /* ----------------------------------------- INVOCATION ---------------------------------------- */
 
@@ -164,6 +164,9 @@ where
             trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
             Self::run_concurrent_inner(self.service, self.config, self.client, self.concurrency_limit).await
         } else {
+            debug!(
+                "Concurrent polling disabled (AWS_LAMBDA_MAX_CONCURRENCY unset or <= 1); falling back to sequential polling"
+            );
             let incoming = incoming(&self.client);
             Self::run_with_incoming(self.service, self.config, incoming).await
         }
@@ -180,11 +183,14 @@ where
 
         // Use FuturesUnordered so we can observe worker exits as they happen,
         // rather than waiting for all workers to finish (join_all).
-        let mut workers: FuturesUnordered<WorkerJoinFuture> = FuturesUnordered::new();
-        let spawn_worker = |service: S, config: Arc<Config>, client: Arc<ApiClient>| -> WorkerJoinFuture {
-            let handle = tokio::spawn(concurrent_worker_loop(service, config, client));
-            let task_id = handle.id();
-            Box::pin(async move { (task_id, handle.await) })
+        let mut workers: FuturesUnordered<tokio::task::JoinHandle<(tokio::task::Id, Result<(), BoxError>)>> =
+            FuturesUnordered::new();
+        let spawn_worker = |service: S, config: Arc<Config>, client: Arc<ApiClient>| {
+            tokio::spawn(async move {
+                let task_id = tokio::task::id();
+                let result = concurrent_worker_loop(service, config, client).await;
+                (task_id, result)
+            })
         };
         // Spawn one worker per concurrency slot; the last uses the owned service to avoid an extra clone.
         for _ in 1..limit {
@@ -203,22 +209,20 @@ where
         // API client failures, runtime panics, etc.
         let mut errors: Vec<WorkerError> = Vec::new();
         let mut remaining_workers = limit;
-        while let Some((task_id, result)) = futures::StreamExt::next(&mut workers).await {
+        while let Some(result) = futures::StreamExt::next(&mut workers).await {
             remaining_workers = remaining_workers.saturating_sub(1);
             match result {
-                Ok(Ok(())) => {
+                Ok((task_id, Ok(()))) => {
                     // `concurrent_worker_loop` runs indefinitely, so an Ok return indicates
                     // an unexpected worker exit; we still decrement because the task is gone.
-                    let clean_exit_msg = "Concurrent worker exited cleanly (unexpected - loop should run forever)";
                     error!(
                         task_id = %task_id,
                         remaining_workers,
-                        "{}",
-                        clean_exit_msg
+                        "Concurrent worker exited cleanly (unexpected - loop should run forever)"
                     );
                     errors.push(WorkerError::CleanExit(task_id));
                 }
-                Ok(Err(err)) => {
+                Ok((task_id, Err(err))) => {
                     error!(
                         task_id = %task_id,
                         error = %err,
@@ -228,6 +232,7 @@ where
                     errors.push(WorkerError::Failure(task_id, err));
                 }
                 Err(join_err) => {
+                    let task_id = join_err.id();
                     let err: BoxError = Box::new(join_err);
                     error!(
                         task_id = %task_id,
@@ -253,12 +258,24 @@ enum WorkerError {
     Failure(tokio::task::Id, BoxError),
 }
 
-type WorkerJoinResult = (tokio::task::Id, Result<Result<(), BoxError>, tokio::task::JoinError>);
-type WorkerJoinFuture = BoxFuture<'static, WorkerJoinResult>;
-
 #[derive(Debug)]
 struct ConcurrentWorkerErrors {
     errors: Vec<WorkerError>,
+}
+
+#[derive(Serialize)]
+struct ConcurrentWorkerErrorsPayload<'a> {
+    message: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    clean: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failures: Vec<WorkerFailurePayload>,
+}
+
+#[derive(Serialize)]
+struct WorkerFailurePayload {
+    id: String,
+    err: String,
 }
 
 impl fmt::Display for ConcurrentWorkerErrors {
@@ -272,31 +289,28 @@ impl fmt::Display for ConcurrentWorkerErrors {
             }
         }
 
-        if failures.is_empty() && !clean.is_empty() {
-            write!(
-                f,
-                "all concurrent workers exited cleanly (unexpected - loop should run forever)"
-            )?;
-            for task_id in clean {
-                write!(f, " [task {task_id}]")?;
-            }
-            return Ok(());
-        }
+        let clean_ids: Vec<String> = clean.iter().map(|task_id| task_id.to_string()).collect();
+        let failure_entries: Vec<WorkerFailurePayload> = failures
+            .iter()
+            .map(|(task_id, err)| WorkerFailurePayload {
+                id: task_id.to_string(),
+                err: err.to_string(),
+            })
+            .collect();
 
-        write!(f, "concurrent workers exited unexpectedly")?;
-        if !clean.is_empty() {
-            write!(f, "; clean exits:")?;
-            for task_id in clean {
-                write!(f, " [task {task_id}]")?;
-            }
-        }
-        if !failures.is_empty() {
-            write!(f, "; failures:")?;
-            for (task_id, err) in failures {
-                write!(f, " [task {task_id}] {err}")?;
-            }
-        }
-        Ok(())
+        let message = if failures.is_empty() && !clean.is_empty() {
+            "all concurrent workers exited cleanly (unexpected - loop should run forever)"
+        } else {
+            "concurrent workers exited unexpectedly"
+        };
+
+        let payload = ConcurrentWorkerErrorsPayload {
+            message,
+            clean: clean_ids,
+            failures: failure_entries,
+        };
+        let json = serde_json::to_string(&payload).map_err(|_| fmt::Error)?;
+        write!(f, "{json}")
     }
 }
 
@@ -384,7 +398,7 @@ fn incoming(
 }
 
 /// Creates a future that polls the `/next` endpoint.
-async fn next_event_future(client: Arc<ApiClient>) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
+async fn next_event_future(client: &ApiClient) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
     let req = NextEventRequest.into_req()?;
     client.call(req).await
 }
@@ -406,9 +420,9 @@ where
     S::Future: Send,
 {
     let task_id = tokio::task::id();
-    let span = info_span!("concurrent_worker_loop", task_id = %task_id);
+    let span = info_span!("worker", task_id = %task_id);
     loop {
-        let event = match next_event_future(client.clone()).await {
+        let event = match next_event_future(client.as_ref()).instrument(span.clone()).await {
             Ok(event) => event,
             Err(e) => {
                 warn!(task_id = %task_id, error = %e, "Error polling /next, retrying");
