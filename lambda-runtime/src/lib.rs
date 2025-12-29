@@ -97,8 +97,9 @@ where
 /// # Managed concurrency
 /// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
 /// it does not enable concurrent polling. If your handler can satisfy `Clone`,
-/// prefer [`run_concurrent`], which honors managed concurrency and falls back to
-/// sequential behavior when unset.
+/// prefer [`run_concurrent`] (requires the `experimental-concurrency` feature),
+/// which honors managed concurrency and falls back to sequential behavior when
+/// unset.
 ///
 /// # Example
 /// ```no_run
@@ -135,6 +136,8 @@ where
 /// Starts the Lambda Rust runtime in a mode that is compatible with
 /// Lambda Managed Instances (concurrent invocations).
 ///
+/// Requires the `experimental-concurrency` feature.
+///
 /// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
 /// will spawn `AWS_LAMBDA_MAX_CONCURRENCY` worker tasks, each running its own
 /// `/next` polling loop. When the environment variable is unset or `<= 1`, it
@@ -160,6 +163,8 @@ where
 ///     Ok(event.payload)
 /// }
 /// ```
+#[cfg(feature = "experimental-concurrency")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-concurrency")))]
 pub async fn run_concurrent<A, F, R, B, S, D, E>(handler: F) -> Result<(), Error>
 where
     F: Service<LambdaEvent<A>, Response = R> + Clone + Send + 'static,

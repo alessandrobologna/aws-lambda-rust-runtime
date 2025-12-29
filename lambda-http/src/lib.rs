@@ -102,7 +102,9 @@ use std::{
 };
 
 mod streaming;
-pub use streaming::{run_with_streaming_response, run_with_streaming_response_concurrent, StreamAdapter};
+#[cfg(feature = "experimental-concurrency")]
+pub use streaming::run_with_streaming_response_concurrent;
+pub use streaming::{run_with_streaming_response, StreamAdapter};
 
 /// Type alias for `http::Request`s with a fixed [`Body`](enum.Body.html) type
 pub type Request = http::Request<Body>;
@@ -211,8 +213,9 @@ where
 /// # Managed concurrency
 /// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
 /// it does not enable concurrent polling. If your handler can satisfy `Clone`,
-/// prefer [`run_concurrent`], which honors managed concurrency and falls back to
-/// sequential behavior when unset.
+/// prefer [`run_concurrent`] (requires the `experimental-concurrency` feature),
+/// which honors managed concurrency and falls back to sequential behavior when
+/// unset.
 pub async fn run<'a, R, S, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = R, Error = E>,
@@ -226,11 +229,15 @@ where
 /// Starts the Lambda Rust runtime in a mode that is compatible with
 /// Lambda Managed Instances (concurrent invocations).
 ///
+/// Requires the `experimental-concurrency` feature.
+///
 /// When `AWS_LAMBDA_MAX_CONCURRENCY` is set to a value greater than 1, this
 /// will spawn `AWS_LAMBDA_MAX_CONCURRENCY` worker tasks, each running its own
 /// `/next` polling loop. When the environment variable is unset or `<= 1`,
 /// it falls back to the same sequential behavior as [`run`], so the same
 /// handler can run on both classic Lambda and Lambda Managed Instances.
+#[cfg(feature = "experimental-concurrency")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-concurrency")))]
 pub async fn run_concurrent<R, S, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = R, Error = E> + Clone + Send + 'static,
