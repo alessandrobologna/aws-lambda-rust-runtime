@@ -197,7 +197,7 @@ where
         let LambdaEvent { payload, context } = req;
         let request_origin = payload.request_origin();
         let mut event: Request = payload.into();
-        update_xray_trace_id_header_from_context(event.headers_mut(), &context);
+        update_xray_trace_id_header(event.headers_mut(), &context);
         let fut = Box::pin(self.service.call(event.with_lambda_context(context)));
 
         TransformResponse::Request(request_origin, fut)
@@ -248,10 +248,17 @@ where
     lambda_runtime::run_concurrent(Adapter::from(handler)).await
 }
 
-// Replaces update_xray_trace_id_header (env var), now set from Context
-fn update_xray_trace_id_header_from_context(headers: &mut http::HeaderMap, context: &Context) {
+// In concurrent mode we must use the per-request context; otherwise the env var is sufficient.
+fn update_xray_trace_id_header(headers: &mut http::HeaderMap, context: &Context) {
+    #[cfg(feature = "experimental-concurrency")]
     if let Some(trace_id) = context.xray_trace_id.as_deref() {
         if let Ok(header_value) = http::HeaderValue::from_str(trace_id) {
+            headers.insert(http::header::HeaderName::from_static("x-amzn-trace-id"), header_value);
+        }
+    }
+    #[cfg(not(feature = "experimental-concurrency"))]
+    if let Ok(trace_id) = std::env::var("_X_AMZN_TRACE_ID") {
+        if let Ok(header_value) = http::HeaderValue::from_str(&trace_id) {
             headers.insert(http::header::HeaderName::from_static("x-amzn-trace-id"), header_value);
         }
     }
