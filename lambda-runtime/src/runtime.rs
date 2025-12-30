@@ -4,14 +4,19 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
+#[cfg(feature = "experimental-concurrency")]
 use futures::stream::FuturesUnordered;
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, fmt::Debug, future::Future, io, sync::Arc};
+#[cfg(feature = "experimental-concurrency")]
+use std::fmt;
+use std::{env, fmt::Debug, future::Future, io, sync::Arc};
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
-use tracing::{debug, error, info_span, trace, warn, Instrument};
+use tracing::trace;
+#[cfg(feature = "experimental-concurrency")]
+use tracing::{debug, error, info_span, warn, Instrument};
 
 /* ----------------------------------------- INVOCATION ---------------------------------------- */
 
