@@ -334,7 +334,6 @@ where
     /// concurrent polling. Enable the `experimental-concurrency` feature and use
     /// [`Runtime::run_concurrent`] instead.
     pub async fn run(self) -> Result<(), BoxError> {
-        #[cfg(feature = "experimental-concurrency")]
         if let Some(raw) = concurrency_env_value() {
             return Err(Box::new(io::Error::other(format!(
                 "AWS_LAMBDA_MAX_CONCURRENCY is set to '{raw}', but Runtime::run does not support concurrent polling; enable the experimental-concurrency feature and use Runtime::run_concurrent instead"

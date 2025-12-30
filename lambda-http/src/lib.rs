@@ -248,17 +248,10 @@ where
     lambda_runtime::run_concurrent(Adapter::from(handler)).await
 }
 
-// In concurrent mode we must use the per-request context; otherwise the env var is sufficient.
+// In concurrent mode we must use the per-request context.
 fn update_xray_trace_id_header(headers: &mut http::HeaderMap, context: &Context) {
-    #[cfg(feature = "experimental-concurrency")]
     if let Some(trace_id) = context.xray_trace_id.as_deref() {
         if let Ok(header_value) = http::HeaderValue::from_str(trace_id) {
-            headers.insert(http::header::HeaderName::from_static("x-amzn-trace-id"), header_value);
-        }
-    }
-    #[cfg(not(feature = "experimental-concurrency"))]
-    if let Ok(trace_id) = std::env::var("_X_AMZN_TRACE_ID") {
-        if let Ok(header_value) = http::HeaderValue::from_str(&trace_id) {
             headers.insert(http::header::HeaderName::from_static("x-amzn-trace-id"), header_value);
         }
     }
