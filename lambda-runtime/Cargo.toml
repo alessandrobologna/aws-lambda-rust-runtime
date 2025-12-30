@@ -25,6 +25,7 @@ miette = ["dep:miette"] # enables From<T> for Diagnostic for miette error types,
 # as well as default features
 # https://github.com/aws/aws-lambda-rust-runtime/issues/984
 graceful-shutdown = ["tokio/rt", "tokio/signal", "dep:lambda-extension"]
+experimental-concurrency = []
 
 [dependencies]
 anyhow = { version = "1.0.86", optional = true }

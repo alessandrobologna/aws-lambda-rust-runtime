@@ -1,6 +1,4 @@
-use crate::{
-    http::header::SET_COOKIE, request::LambdaRequest, update_xray_trace_id_header_from_context, Request, RequestExt,
-};
+use crate::{http::header::SET_COOKIE, request::LambdaRequest, update_xray_trace_id_header, Request, RequestExt};
 use bytes::Bytes;
 use core::{
     fmt::Debug,
@@ -76,7 +74,7 @@ where
     fn call(&mut self, req: LambdaEvent<LambdaRequest>) -> Self::Future {
         let LambdaEvent { payload, context } = req;
         let mut event: Request = payload.into();
-        update_xray_trace_id_header_from_context(event.headers_mut(), &context);
+        update_xray_trace_id_header(event.headers_mut(), &context);
         Box::pin(
             self.service
                 .call(event.with_lambda_context(context))
@@ -116,8 +114,10 @@ where
 
 /// Builds a streaming-aware Tower service from a `Service<Request>` that can be
 /// cloned and sent across tasks. This is used by the concurrent HTTP entrypoint.
+#[cfg(feature = "experimental-concurrency")]
 type EventToRequest = fn(LambdaEvent<LambdaRequest>) -> Request;
 
+#[cfg(feature = "experimental-concurrency")]
 #[allow(clippy::type_complexity)]
 fn into_stream_service_cloneable<S, B, E>(
     handler: S,
@@ -166,7 +166,7 @@ where
 fn event_to_request(req: LambdaEvent<LambdaRequest>) -> Request {
     let LambdaEvent { payload, context } = req;
     let mut event: Request = payload.into();
-    update_xray_trace_id_header_from_context(event.headers_mut(), &context);
+    update_xray_trace_id_header(event.headers_mut(), &context);
     event.with_lambda_context(context)
 }
 
@@ -178,7 +178,7 @@ fn event_to_request(req: LambdaEvent<LambdaRequest>) -> Request {
 /// # Managed concurrency
 /// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this function returns an error because
 /// it does not enable concurrent polling. Use [`run_with_streaming_response_concurrent`]
-/// instead.
+/// (requires the `experimental-concurrency` feature) instead.
 ///
 /// [AWS docs for response streaming]:
 ///     https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html
@@ -197,9 +197,13 @@ where
 /// Runs the Lambda runtime with a handler that returns **streaming** HTTP
 /// responses, in a mode that is compatible with Lambda Managed Instances.
 ///
+/// Requires the `experimental-concurrency` feature.
+///
 /// This uses a cloneable, boxed service internally so it can be driven by the
 /// concurrent runtime. When `AWS_LAMBDA_MAX_CONCURRENCY` is not set or `<= 1`,
 /// it falls back to the same sequential behavior as [`run_with_streaming_response`].
+#[cfg(feature = "experimental-concurrency")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-concurrency")))]
 pub async fn run_with_streaming_response_concurrent<S, B, E>(handler: S) -> Result<(), Error>
 where
     S: Service<Request, Response = Response<B>, Error = E> + Clone + Send + 'static,

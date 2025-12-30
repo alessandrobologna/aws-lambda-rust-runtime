@@ -4,14 +4,19 @@ use crate::{
     types::{invoke_request_id, IntoFunctionResponse, LambdaEvent},
     Config, Context, Diagnostic,
 };
+#[cfg(feature = "experimental-concurrency")]
 use futures::stream::FuturesUnordered;
 use http_body_util::BodyExt;
 use lambda_runtime_api_client::{BoxError, Client as ApiClient};
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, fmt::Debug, future::Future, io, sync::Arc};
+#[cfg(feature = "experimental-concurrency")]
+use std::fmt;
+use std::{env, fmt::Debug, future::Future, io, sync::Arc};
 use tokio_stream::{Stream, StreamExt};
 use tower::{Layer, Service, ServiceExt};
-use tracing::{debug, error, info_span, trace, warn, Instrument};
+use tracing::trace;
+#[cfg(feature = "experimental-concurrency")]
+use tracing::{debug, error, info_span, warn, Instrument};
 
 /* ----------------------------------------- INVOCATION ---------------------------------------- */
 
@@ -149,6 +154,7 @@ impl<S> Runtime<S> {
     }
 }
 
+#[cfg(feature = "experimental-concurrency")]
 impl<S> Runtime<S>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError> + Clone + Send + 'static,
@@ -159,6 +165,7 @@ where
     /// If `AWS_LAMBDA_MAX_CONCURRENCY` is not set or is `<= 1`, this falls back to the
     /// sequential `run_with_incoming` loop so that the same handler can run on both
     /// classic Lambda and Lambda Managed Instances.
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-concurrency")))]
     pub async fn run_concurrent(self) -> Result<(), BoxError> {
         if self.concurrency_limit > 1 {
             trace!("Concurrent mode: _X_AMZN_TRACE_ID is not set; use context.xray_trace_id");
@@ -252,17 +259,20 @@ where
     }
 }
 
+#[cfg(feature = "experimental-concurrency")]
 #[derive(Debug)]
 enum WorkerError {
     CleanExit(tokio::task::Id),
     Failure(tokio::task::Id, BoxError),
 }
 
+#[cfg(feature = "experimental-concurrency")]
 #[derive(Debug)]
 struct ConcurrentWorkerErrors {
     errors: Vec<WorkerError>,
 }
 
+#[cfg(feature = "experimental-concurrency")]
 #[derive(Serialize)]
 struct ConcurrentWorkerErrorsPayload<'a> {
     message: &'a str,
@@ -272,12 +282,14 @@ struct ConcurrentWorkerErrorsPayload<'a> {
     failures: Vec<WorkerFailurePayload>,
 }
 
+#[cfg(feature = "experimental-concurrency")]
 #[derive(Serialize)]
 struct WorkerFailurePayload {
     id: String,
     err: String,
 }
 
+#[cfg(feature = "experimental-concurrency")]
 impl fmt::Display for ConcurrentWorkerErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut clean = Vec::new();
@@ -314,6 +326,7 @@ impl fmt::Display for ConcurrentWorkerErrors {
     }
 }
 
+#[cfg(feature = "experimental-concurrency")]
 impl std::error::Error for ConcurrentWorkerErrors {}
 
 impl<S> Runtime<S>
@@ -323,11 +336,12 @@ where
     /// Start the runtime and begin polling for events on the Lambda Runtime API.
     ///
     /// If `AWS_LAMBDA_MAX_CONCURRENCY` is set, this returns an error because it does not enable
-    /// concurrent polling. Use [`Runtime::run_concurrent`] instead.
+    /// concurrent polling. Enable the `experimental-concurrency` feature and use
+    /// [`Runtime::run_concurrent`] instead.
     pub async fn run(self) -> Result<(), BoxError> {
         if let Some(raw) = concurrency_env_value() {
             return Err(Box::new(io::Error::other(format!(
-                "AWS_LAMBDA_MAX_CONCURRENCY is set to '{raw}', but Runtime::run does not support concurrent polling; use Runtime::run_concurrent instead"
+                "AWS_LAMBDA_MAX_CONCURRENCY is set to '{raw}', but Runtime::run does not support concurrent polling; enable the experimental-concurrency feature and use Runtime::run_concurrent instead"
             ))));
         }
         let incoming = incoming(&self.client);
@@ -398,6 +412,7 @@ fn incoming(
 }
 
 /// Creates a future that polls the `/next` endpoint.
+#[cfg(feature = "experimental-concurrency")]
 async fn next_event_future(client: &ApiClient) -> Result<http::Response<hyper::body::Incoming>, BoxError> {
     let req = NextEventRequest.into_req()?;
     client.call(req).await
@@ -414,6 +429,7 @@ fn concurrency_env_value() -> Option<String> {
     env::var("AWS_LAMBDA_MAX_CONCURRENCY").ok()
 }
 
+#[cfg(feature = "experimental-concurrency")]
 async fn concurrent_worker_loop<S>(mut service: S, config: Arc<Config>, client: Arc<ApiClient>) -> Result<(), BoxError>
 where
     S: Service<LambdaInvocation, Response = (), Error = BoxError>,
@@ -744,6 +760,7 @@ mod endpoint_tests {
         .await
     }
 
+    #[cfg(feature = "experimental-concurrency")]
     #[tokio::test]
     async fn concurrent_worker_crash_does_not_stop_other_workers() -> Result<(), Error> {
         let next_calls = Arc::new(AtomicUsize::new(0));
